@@ -288,7 +288,7 @@ pub(crate) fn remove_fact(
 ) -> Result<Option<String>, Error> {
     let factual_position : usize = args["fact_to_be_removed"].convert()?;
 
-    if factual_position > context.player_state.available_information.len() {
+    if factual_position > context.player_state.available_information.len() || factual_position == 0 {
         return Err(Error::BadFactIndex(factual_position));
     }
 
