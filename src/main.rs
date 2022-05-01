@@ -26,6 +26,7 @@ impl Context {
         self.current_decks.iter().all(|d| d.len() == self.num_cards)
             && self.current_decks.iter().all_unique()
             && self.num_regular_fascists <= self.table_size
+            && self.player_info.len() == self.table_size
             && self.current_roles.iter().all(|ra| {
                 ra.len() == self.table_size
                     && ra
@@ -49,7 +50,8 @@ enum Error {
     ParseRoleError(String),
     FileSystemError(io::Error),
     TooLongPatternError { have : usize, requested : usize },
-    ReplError(repl_rs::Error)
+    ReplError(repl_rs::Error),
+    LogicalInconsistency
 }
 
 impl From<repl_rs::Error> for Error {
@@ -84,7 +86,8 @@ impl fmt::Display for Error {
             ),
             Error::ReplError(error) => write!(f, "{}", error),
             Error::BadPlayerID(id) => write!(f, "Failed to recognize player {}.", id),
-            Error::FileSystemError(fserror) => write!(f, "Filesystem error: {fserror}")
+            Error::FileSystemError(fserror) => write!(f, "Filesystem error: {fserror}"),
+            Error::LogicalInconsistency => write!(f, "Detected a logical inconsistency, check your fact database to debug it.")
         }
     }
 }
@@ -557,7 +560,8 @@ fn add_hard_fact(
 
     Ok(Some(format!(
         "Successfully added the information that player {} is {} to the fact database.",
-        factual_position, factual_role
+        format_name(factual_position, &context.player_info),
+        factual_role
     )))
 }
 
@@ -574,8 +578,9 @@ fn add_conflict(
         .push(Information::PolicyConflict(president, chancellor));
 
     Ok(Some(format!(
-        "Successfully added the conflict between {president} and {chancellor} to the fact \
-         database."
+        "Successfully added the conflict between {} and {} to the fact database.",
+        format_name(president, &context.player_info),
+        format_name(chancellor, &context.player_info)
     )))
 }
 
@@ -595,8 +600,9 @@ fn liberal_investigation(
         });
 
     Ok(Some(format!(
-        "Successfully added the liberal investigation of {investigator} on {investigatee} to the \
-         fact database."
+        "Successfully added the liberal investigation of {} on {} to the fact database.",
+        format_name(investigator, &context.player_info),
+        format_name(investigatee, &context.player_info)
     )))
 }
 
@@ -616,8 +622,9 @@ fn fascist_investigation(
         });
 
     Ok(Some(format!(
-        "Successfully added the fascist investigation of {investigator} on {investigatee} to the \
-         fact database."
+        "Successfully added the fascist investigation of {} on {} to the fact database.",
+        format_name(investigator, &context.player_info),
+        format_name(investigatee, &context.player_info)
     )))
 }
 
@@ -633,7 +640,8 @@ fn confirm_not_hitler(
         .push(Information::ConfirmedNotHitler(player));
 
     Ok(Some(format!(
-        "Successfully added the confirmation that player {player} is not Hitler to the database."
+        "Successfully added the confirmation that player {} is not Hitler to the database.",
+        format_name(player, &context.player_info)
     )))
 }
 
@@ -663,7 +671,9 @@ fn debug_filtered_roles(
             .into_iter()
             .map(|vpol| {
                 vpol.iter()
-                    .map(|(pos, role)| format!("({}: {})", pos, role))
+                    .map(|(pos, role)| {
+                        format!("({}: {})", format_name(*pos, &context.player_info), role)
+                    })
                     .join(", ")
             })
             .join("\n")
@@ -690,7 +700,12 @@ fn filter_assigned_roles(
             .unwrap_or(false)
         })
         .collect_vec();
-    Ok(filtered_assignments)
+    if filtered_assignments.is_empty() {
+        Err(Error::LogicalInconsistency)
+    }
+    else {
+        Ok(filtered_assignments)
+    }
 }
 
 #[debug_invariant(context.invariant())]
@@ -721,7 +736,11 @@ fn impossible_teams(
     Ok(Some(
         all_potential_fascist_teams
             .into_iter()
-            .map(|vfas| vfas.into_iter().map(|fpos| format!("{fpos}")).join(", "))
+            .map(|vfas| {
+                vfas.into_iter()
+                    .map(|fpos| format_name(fpos, &context.player_info))
+                    .join(" and ")
+            })
             .map(|s| format!("{s} can't ALL be fascists at the same time."))
             .join("\n")
     ))
@@ -780,9 +799,9 @@ fn hitler_snipe(
             .enumerate()
             .map(|(index, (pid, (hitler_count, total_count)))| {
                 format!(
-                    "{}. Player {pid}: {:.1}% ({hitler_count}/{total_count}) chance of being \
-                     Hitler.",
+                    "{}. Player {}: {:.1}% ({hitler_count}/{total_count}) chance of being Hitler.",
                     index + 1,
+                    format_name(*pid, &context.player_info),
                     (hitler_count as f64 / total_count as f64) * 100.0
                 )
             })
@@ -812,12 +831,24 @@ fn liberal_percent(
             .sorted_by_key(|(pid, (_lib_count, _total_count))| *pid)
             .map(|(pid, (lib_count, total_count))| {
                 format!(
-                    "Player {pid}: {:.1}% ({lib_count}/{total_count}) chance of being a liberal.",
+                    "Player {}: {:.1}% ({lib_count}/{total_count}) chance of being a liberal.",
+                    format_name(*pid, &context.player_info),
                     (lib_count as f64 / total_count as f64) * 100.0
                 )
             })
             .join("\n")
     ))
+}
+
+fn format_name(pid : usize, players : &BTreeMap<PlayerID, PlayerInfo>) -> String {
+    let name = players.get(&pid).unwrap();
+
+    if name.is_empty() {
+        format!("{pid}")
+    }
+    else {
+        format!("{pid}. {}", name)
+    }
 }
 
 fn generate_dot_report(
@@ -829,6 +860,8 @@ fn generate_dot_report(
         node_attributes.insert(*key, vec![]);
     });
     let mut statements = vec![];
+
+    let display_name = |pid| format_name(pid, players);
 
     for info in information {
         match info {
@@ -854,12 +887,13 @@ fn generate_dot_report(
         .into_iter()
         .map(|(pid, vinfo)| {
             format!(
-                "{pid} [{}]",
+                "{pid} [label=\"{}\",{}]",
+                display_name(pid),
                 vinfo
                     .into_iter()
                     .map(|info| match info {
                         Information::ConfirmedNotHitler(_) => {
-                            format!("label=\"\\N\\nConfirmed not Hitler.\"")
+                            format!("label=\"{}\\nConfirmed not Hitler.\"", display_name(pid))
                         },
                         Information::HardFact(_pid, role) =>
                             format!("color={}", if role.is_fascist() { "red" } else { "blue" }),
@@ -885,6 +919,18 @@ fn graph(args : HashMap<String, Value>, context : &mut Context) -> Result<Option
 
     Ok(Some(format!(
         "Run \"dot -Tpng -o {filename}.png {filename}.dot\" to generate the graph."
+    )))
+}
+
+#[debug_invariant(context.invariant())]
+fn name(args : HashMap<String, Value>, context : &mut Context) -> Result<Option<String>, Error> {
+    let position : usize = args["position"].convert()?;
+    let name : String = args["display_name"].convert()?;
+
+    *context.player_info.entry(position).or_default() = name.clone();
+
+    Ok(Some(format!(
+        "Successfully registered the name {name} for player {position}."
     )))
 }
 
@@ -1029,7 +1075,13 @@ fn main() -> Result<(), Error> {
         .add_command(
             Command::new("graph", graph)
                 .with_parameter(Parameter::new("filename").set_required(true)?)?
-                .with_help("Generates the graph.")
+                .with_help("Generates the graphviz graph.")
+        )
+        .add_command(
+            Command::new("name", name)
+                .with_parameter(Parameter::new("position").set_required(true)?)?
+                .with_parameter(Parameter::new("display_name").set_required(true)?)?
+                .with_help("Names a player for nicer reading.")
         )
         .run()?)
 }
