@@ -80,13 +80,11 @@ fn valid_role_assignments(
         .map(|vb| vb.into_iter().all(|x| x))
 }
 
-pub(super) fn filter_assigned_roles(
-    args : HashMap<String, Value>,
-    player_state : &PlayerState
+pub(super) fn filter_assigned_roles_invonvenient(
+    player_state : &PlayerState,
+    allow_fascist_fascist_conflict : bool,
+    allow_aggressive_hitler : bool
 ) -> Result<Vec<&BTreeMap<usize, SecretRole>>, Error> {
-    let allow_fascist_fascist_conflict : bool = args["allow_fascist_fascist_conflict"].convert()?;
-    let allow_aggressive_hitler : bool = args["allow_aggressive_hitler"].convert()?;
-
     let filtered_assignments = player_state
         .current_roles
         .iter()
@@ -106,6 +104,20 @@ pub(super) fn filter_assigned_roles(
     else {
         Ok(filtered_assignments)
     }
+}
+
+pub(super) fn filter_assigned_roles(
+    args : HashMap<String, Value>,
+    player_state : &PlayerState
+) -> Result<Vec<&BTreeMap<usize, SecretRole>>, Error> {
+    let allow_fascist_fascist_conflict : bool = args["allow_fascist_fascist_conflict"].convert()?;
+    let allow_aggressive_hitler : bool = args["allow_aggressive_hitler"].convert()?;
+
+    filter_assigned_roles_invonvenient(
+        player_state,
+        allow_fascist_fascist_conflict,
+        allow_aggressive_hitler
+    )
 }
 
 #[debug_invariant(context.invariant())]

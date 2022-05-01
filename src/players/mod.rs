@@ -39,7 +39,10 @@ impl PlayerState {
                         .filter(|(_pid, role)| **role == SecretRole::Hitler)
                         .count()
                         == 1
+                    && ra.iter().map(|(pid, _)| pid).collect_vec()
+                        == self.player_info.iter().map(|(pid, _)| pid).collect_vec()
             })
+            && filter_assigned_roles_invonvenient(self, true, true).is_ok()
     }
 }
 
@@ -151,6 +154,10 @@ pub(crate) fn add_hard_fact(
     let factual_role : String = args["role"].convert()?;
     let factual_role : SecretRole = factual_role.parse()?;
 
+    if !player_state.player_info.contains_key(&factual_position) {
+        return Err(Error::BadPlayerID(factual_position));
+    }
+
     player_state
         .available_information
         .push(Information::HardFact(factual_position, factual_role));
@@ -171,6 +178,14 @@ pub(crate) fn add_conflict(
     let president : PlayerID = args["president"].convert()?;
     let chancellor : PlayerID = args["chancellor"].convert()?;
 
+    if !player_state.player_info.contains_key(&president) {
+        return Err(Error::BadPlayerID(president));
+    }
+
+    if !player_state.player_info.contains_key(&chancellor) {
+        return Err(Error::BadPlayerID(chancellor));
+    }
+
     player_state
         .available_information
         .push(Information::PolicyConflict(president, chancellor));
@@ -190,6 +205,14 @@ pub(crate) fn liberal_investigation(
     let mut player_state = &mut context.player_state;
     let investigator : PlayerID = args["investigator"].convert()?;
     let investigatee : PlayerID = args["investigatee"].convert()?;
+
+    if !player_state.player_info.contains_key(&investigator) {
+        return Err(Error::BadPlayerID(investigator));
+    }
+
+    if !player_state.player_info.contains_key(&investigatee) {
+        return Err(Error::BadPlayerID(investigatee));
+    }
 
     player_state
         .available_information
@@ -214,6 +237,14 @@ pub(crate) fn fascist_investigation(
     let investigator : PlayerID = args["investigator"].convert()?;
     let investigatee : PlayerID = args["investigatee"].convert()?;
 
+    if !player_state.player_info.contains_key(&investigator) {
+        return Err(Error::BadPlayerID(investigator));
+    }
+
+    if !player_state.player_info.contains_key(&investigatee) {
+        return Err(Error::BadPlayerID(investigatee));
+    }
+
     player_state
         .available_information
         .push(Information::FascistInvestigation {
@@ -236,6 +267,10 @@ pub(crate) fn confirm_not_hitler(
     let mut player_state = &mut context.player_state;
     let player : PlayerID = args["player"].convert()?;
 
+    if !player_state.player_info.contains_key(&player) {
+        return Err(Error::BadPlayerID(player));
+    }
+
     player_state
         .available_information
         .push(Information::ConfirmedNotHitler(player));
@@ -252,6 +287,10 @@ pub(crate) fn remove_fact(
     context : &mut Context
 ) -> Result<Option<String>, Error> {
     let factual_position : usize = args["fact_to_be_removed"].convert()?;
+
+    if factual_position >= context.player_state.available_information.len() {
+        return Err(Error::BadFactIndex(factual_position));
+    }
 
     context
         .player_state
@@ -395,13 +434,16 @@ pub(crate) fn liberal_percent(
 }
 
 fn format_name(pid : usize, players : &BTreeMap<PlayerID, PlayerInfo>) -> String {
-    let name = players.get(&pid).unwrap();
-
-    if name.is_empty() {
-        format!("{pid}")
+    if let Some(name) = players.get(&pid) {
+        if name.is_empty() {
+            format!("{pid}")
+        }
+        else {
+            format!("{pid}. {}", name)
+        }
     }
     else {
-        format!("{pid}. {}", name)
+        format!("{pid}")
     }
 }
 
@@ -494,8 +536,8 @@ pub(crate) fn name(
     *context
         .player_state
         .player_info
-        .entry(position)
-        .or_default() = name.clone();
+        .get_mut(&position)
+        .ok_or(Error::BadPlayerID(position))? = name.clone();
 
     Ok(Some(format!(
         "Successfully registered the name {name} for player {position}."

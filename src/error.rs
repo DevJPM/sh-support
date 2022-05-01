@@ -9,7 +9,8 @@ pub(crate) enum Error {
     FileSystemError(io::Error),
     TooLongPatternError { have : usize, requested : usize },
     ReplError(repl_rs::Error),
-    LogicalInconsistency
+    LogicalInconsistency,
+    BadFactIndex(usize)
 }
 
 impl From<repl_rs::Error> for Error {
@@ -48,7 +49,8 @@ impl fmt::Display for Error {
             Error::LogicalInconsistency => write!(
                 f,
                 "Detected a logical inconsistency, check your fact database to debug it."
-            )
+            ),
+            Error::BadFactIndex(index) => write!(f, "Fact #{index} does not exist.")
         }
     }
 }
