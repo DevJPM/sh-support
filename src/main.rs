@@ -6,24 +6,39 @@ use std::{
 use contracts::{debug_ensures, debug_invariant};
 use itertools::Itertools;
 use repl_rs::{Command, Convert, Parameter, Repl, Value};
-use std::{fmt, result::Result, str};
+use std::{fmt, fs, io, result::Result, str};
 
 //fn approx_one(value : f64) -> bool { (value - 1.0).abs() <= 1e-6 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Context {
     num_cards : usize,
     current_decks : Vec<Vec<Policy>>,
     table_size : usize,
     num_regular_fascists : usize,
     available_information : Vec<Information>,
-    current_roles : Vec<BTreeMap<PlayerID, SecretRole>>
+    current_roles : Vec<BTreeMap<PlayerID, SecretRole>>,
+    player_info : BTreeMap<PlayerID, PlayerInfo>
 }
 
 impl Context {
     fn invariant(&self) -> bool {
         self.current_decks.iter().all(|d| d.len() == self.num_cards)
             && self.current_decks.iter().all_unique()
+            && self.num_regular_fascists <= self.table_size
+            && self.current_roles.iter().all(|ra| {
+                ra.len() == self.table_size
+                    && ra
+                        .iter()
+                        .filter(|(_pid, role)| **role == SecretRole::RegularFascist)
+                        .count()
+                        == self.num_regular_fascists
+                    && ra
+                        .iter()
+                        .filter(|(_pid, role)| **role == SecretRole::Hitler)
+                        .count()
+                        == 1
+            })
     }
 }
 
@@ -32,6 +47,7 @@ enum Error {
     BadPlayerID(PlayerID),
     ParsePolicyError(String),
     ParseRoleError(String),
+    FileSystemError(io::Error),
     TooLongPatternError { have : usize, requested : usize },
     ReplError(repl_rs::Error)
 }
@@ -42,6 +58,10 @@ impl From<repl_rs::Error> for Error {
 
 impl From<Utf8Error> for Error {
     fn from(error : Utf8Error) -> Self { Error::ParsePolicyError(error.to_string()) }
+}
+
+impl From<io::Error> for Error {
+    fn from(error : io::Error) -> Self { Error::FileSystemError(error) }
 }
 
 impl fmt::Display for Error {
@@ -63,12 +83,13 @@ impl fmt::Display for Error {
                 found
             ),
             Error::ReplError(error) => write!(f, "{}", error),
-            Error::BadPlayerID(id) => write!(f, "Failed to recognize player {}.", id)
+            Error::BadPlayerID(id) => write!(f, "Failed to recognize player {}.", id),
+            Error::FileSystemError(fserror) => write!(f, "Filesystem error: {fserror}")
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Policy {
     Liberal,
     Fascist
@@ -109,7 +130,9 @@ impl SecretRole {
 }
 
 type PlayerID = usize;
+type PlayerInfo = String;
 
+#[derive(Copy, Clone, Debug)]
 enum Information {
     ConfirmedNotHitler(PlayerID),
     PolicyConflict(PlayerID, PlayerID),
@@ -427,6 +450,7 @@ fn debug_decks(
     ))
 }
 
+#[debug_invariant(context.invariant())]
 fn roles(args : HashMap<String, Value>, context : &mut Context) -> Result<Option<String>, Error> {
     context.current_roles.clear();
     context.available_information.clear();
@@ -437,6 +461,10 @@ fn roles(args : HashMap<String, Value>, context : &mut Context) -> Result<Option
     let table_size = num_fasc + num_lib + 1;
     context.table_size = table_size;
     context.num_regular_fascists = num_fasc;
+    context.player_info = (1..=table_size)
+        .into_iter()
+        .map(|pid| (pid, "".to_string()))
+        .collect();
 
     context.current_roles = (0..num_fasc + num_lib)
         .into_iter()
@@ -481,6 +509,7 @@ fn roles(args : HashMap<String, Value>, context : &mut Context) -> Result<Option
     )))
 }
 
+#[debug_invariant(context.invariant())]
 fn debug_roles(
     _args : HashMap<String, Value>,
     context : &mut Context
@@ -498,6 +527,7 @@ fn debug_roles(
     ))
 }
 
+#[debug_invariant(context.invariant())]
 fn show_facts(
     _args : HashMap<String, Value>,
     context : &mut Context
@@ -512,6 +542,7 @@ fn show_facts(
     ))
 }
 
+#[debug_invariant(context.invariant())]
 fn add_hard_fact(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -530,6 +561,7 @@ fn add_hard_fact(
     )))
 }
 
+#[debug_invariant(context.invariant())]
 fn add_conflict(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -547,6 +579,7 @@ fn add_conflict(
     )))
 }
 
+#[debug_invariant(context.invariant())]
 fn liberal_investigation(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -567,6 +600,7 @@ fn liberal_investigation(
     )))
 }
 
+#[debug_invariant(context.invariant())]
 fn fascist_investigation(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -587,6 +621,7 @@ fn fascist_investigation(
     )))
 }
 
+#[debug_invariant(context.invariant())]
 fn confirm_not_hitler(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -602,6 +637,7 @@ fn confirm_not_hitler(
     )))
 }
 
+#[debug_invariant(context.invariant())]
 fn remove_fact(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -615,6 +651,7 @@ fn remove_fact(
     )))
 }
 
+#[debug_invariant(context.invariant())]
 fn debug_filtered_roles(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -656,6 +693,7 @@ fn filter_assigned_roles(
     Ok(filtered_assignments)
 }
 
+#[debug_invariant(context.invariant())]
 fn impossible_teams(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -689,6 +727,7 @@ fn impossible_teams(
     ))
 }
 
+#[debug_invariant(context.invariant())]
 fn filtered_histogramm(
     args : HashMap<String, Value>,
     context : &Context
@@ -718,6 +757,7 @@ fn filtered_histogramm(
         .collect())
 }
 
+#[debug_invariant(context.invariant())]
 fn hitler_snipe(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -750,6 +790,7 @@ fn hitler_snipe(
     ))
 }
 
+#[debug_invariant(context.invariant())]
 fn liberal_percent(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -779,11 +820,73 @@ fn liberal_percent(
     ))
 }
 
-// TODO: Add better analysis
-// 3. Generate graph
-// 4. Calculate proabability that someone lied, i.e. probability that the
-// current deck / draw is X given true claims vs "blues disappeared" 5. Support
-// names for I/O with mapping to positions
+fn generate_dot_report(
+    information : &Vec<Information>,
+    players : &BTreeMap<PlayerID, PlayerInfo>
+) -> String {
+    let mut node_attributes : BTreeMap<PlayerID, Vec<Information>> = BTreeMap::new();
+    players.iter().for_each(|(key, _name)| {
+        node_attributes.insert(*key, vec![]);
+    });
+    let mut statements = vec![];
+
+    for info in information {
+        match info {
+            Information::ConfirmedNotHitler(pid) => {
+                node_attributes.entry(*pid).or_default().push(*info)
+            },
+            Information::PolicyConflict(left, right) => {
+                statements.push(format!("{left} -> {right} [dir=both,color=red]"))
+            },
+            Information::LiberalInvestigation {
+                investigator,
+                investigatee
+            } => statements.push(format!("{investigator} -> {investigatee} [color=blue]")),
+            Information::FascistInvestigation {
+                investigator,
+                investigatee
+            } => statements.push(format!("{investigator} -> {investigatee} [color=red]")),
+            Information::HardFact(pid, _) => node_attributes.entry(*pid).or_default().push(*info)
+        }
+    }
+
+    node_attributes
+        .into_iter()
+        .map(|(pid, vinfo)| {
+            format!(
+                "{pid} [{}]",
+                vinfo
+                    .into_iter()
+                    .map(|info| match info {
+                        Information::ConfirmedNotHitler(_) => {
+                            format!("label=\"\\N\\nConfirmed not Hitler.\"")
+                        },
+                        Information::HardFact(_pid, role) =>
+                            format!("color={}", if role.is_fascist() { "red" } else { "blue" }),
+                        _ => unreachable!()
+                    })
+                    .join(",")
+            )
+        })
+        .for_each(|s| statements.push(s));
+
+    let statements = statements.into_iter().join(";");
+
+    format!("digraph {{{statements}}}")
+}
+
+#[debug_invariant(context.invariant())]
+fn graph(args : HashMap<String, Value>, context : &mut Context) -> Result<Option<String>, Error> {
+    let filename : String = args["filename"].convert()?;
+
+    let file_content = generate_dot_report(&context.available_information, &context.player_info);
+
+    fs::write(format!("{filename}.dot"), file_content)?;
+
+    Ok(Some(format!(
+        "Run \"dot -Tpng -o {filename}.png {filename}.dot\" to generate the graph."
+    )))
+}
 
 fn main() -> Result<(), Error> {
     Ok(Repl::new(Context::default())
@@ -922,6 +1025,11 @@ fn main() -> Result<(), Error> {
                     "Shows the probability of each player being a liberal based on the current \
                      filtered information."
                 )
+        )
+        .add_command(
+            Command::new("graph", graph)
+                .with_parameter(Parameter::new("filename").set_required(true)?)?
+                .with_help("Generates the graph.")
         )
         .run()?)
 }
