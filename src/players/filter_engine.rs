@@ -63,7 +63,7 @@ fn universal_deducable_information(
     }
 }
 
-fn valid_role_assignments(
+pub(super) fn valid_role_assignments(
     roles : &BTreeMap<PlayerID, SecretRole>,
     information : &[Information],
     no_aggressive_hitler : bool,

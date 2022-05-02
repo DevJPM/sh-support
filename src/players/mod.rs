@@ -41,8 +41,9 @@ impl PlayerState {
                         == 1
                     && ra.iter().map(|(pid, _)| pid).collect_vec()
                         == self.player_info.iter().map(|(pid, _)| pid).collect_vec()
+                    && valid_role_assignments(ra, &self.available_information, true, true).is_ok()
             })
-            && filter_assigned_roles_invonvenient(self, true, true).is_ok()
+            && self.current_roles.iter().all_unique()
     }
 }
 
@@ -288,7 +289,8 @@ pub(crate) fn remove_fact(
 ) -> Result<Option<String>, Error> {
     let factual_position : usize = args["fact_to_be_removed"].convert()?;
 
-    if factual_position > context.player_state.available_information.len() || factual_position == 0 {
+    if factual_position > context.player_state.available_information.len() || factual_position == 0
+    {
         return Err(Error::BadFactIndex(factual_position));
     }
 
