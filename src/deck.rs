@@ -120,14 +120,11 @@ fn compute_window_histogram(
         .collect()
 }
 
-#[debug_invariant(context.invariant())]
-pub(crate) fn next(
-    args : HashMap<String, Value>,
-    context : &mut Context
-) -> Result<Option<String>, Error> {
-    let mut deck_state = &mut context.deck_state;
-    let pattern : String = args["pattern"].convert()?;
-
+pub(crate) fn parse_pattern(
+    pattern : String,
+    max_pattern_length : usize,
+    min_pattern_length : usize
+) -> Result<(usize, usize, Vec<Policy>), Error> {
     let pattern : Result<Vec<Policy>, Error> = pattern
         .into_bytes()
         .into_iter()
@@ -139,14 +136,34 @@ pub(crate) fn next(
 
     let pattern_length = pattern.len();
 
-    if pattern_length > deck_state.num_cards {
+    if pattern_length > max_pattern_length {
         return Err(Error::TooLongPatternError {
-            have : deck_state.num_cards,
+            have : max_pattern_length,
+            requested : pattern_length
+        });
+    }
+    if pattern_length < min_pattern_length {
+        return Err(Error::TooShortPatternError {
+            have : max_pattern_length,
             requested : pattern_length
         });
     }
 
     let num_lib_in_pattern = pattern.iter().filter(|p| **p == Policy::Liberal).count();
+
+    Ok((num_lib_in_pattern, pattern_length, pattern))
+}
+
+#[debug_invariant(context.invariant())]
+pub(crate) fn next(
+    args : HashMap<String, Value>,
+    context : &mut Context
+) -> Result<Option<String>, Error> {
+    let mut deck_state = &mut context.deck_state;
+    let pattern : String = args["pattern"].convert()?;
+
+    let (num_lib_in_pattern, pattern_length, pattern) =
+        parse_pattern(pattern, deck_state.num_cards, 0)?;
 
     let num_matching_decks = deck_state
         .current_decks

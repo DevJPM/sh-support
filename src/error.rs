@@ -8,9 +8,11 @@ pub(crate) enum Error {
     ParseRoleError(String),
     FileSystemError(io::Error),
     TooLongPatternError { have : usize, requested : usize },
+    TooShortPatternError { have : usize, requested : usize },
     ReplError(repl_rs::Error),
     LogicalInconsistency,
     BadFactIndex(usize)
+    //ImpossibleConflict
 }
 
 impl From<repl_rs::Error> for Error {
@@ -30,27 +32,32 @@ impl fmt::Display for Error {
         match self {
             Error::TooLongPatternError { have, requested } => write!(
                 f,
-                "Requested a pattern of length {} but only had {} cards in the decks.",
-                requested, have
+                "Requested a pattern of length {requested} but only had {have} cards available.",
+            ),
+            Error::TooShortPatternError { have, requested } => write!(
+                f,
+                "Presented a pattern of length {requested} but the required pattern length is \
+                 {have}.",
             ),
             Error::ParsePolicyError(found) => write!(
                 f,
-                "Failed to parse single-letter policy name, found {} instead.",
-                found
+                "Failed to parse single-letter policy name, found {found} instead."
             ),
-            Error::ParseRoleError(found) => write!(
-                f,
-                "Failed to parse role name name, found {} instead.",
-                found
-            ),
-            Error::ReplError(error) => write!(f, "{}", error),
-            Error::BadPlayerID(id) => write!(f, "Failed to recognize player {}.", id),
+            Error::ParseRoleError(found) => {
+                write!(f, "Failed to parse role name name, found {found} instead.")
+            },
+            Error::ReplError(error) => write!(f, "{error}"),
+            Error::BadPlayerID(id) => write!(f, "Failed to recognize player {id}."),
             Error::FileSystemError(fserror) => write!(f, "Filesystem error: {fserror}"),
             Error::LogicalInconsistency => write!(
                 f,
                 "Detected a logical inconsistency, check your fact database to debug it."
             ),
             Error::BadFactIndex(index) => write!(f, "Fact #{index} does not exist.")
+            /* Error::ImpossibleConflict => write!(
+                f,
+                "It's impossible for a conflict to occur with RRR presidential claims."
+            )*/
         }
     }
 }

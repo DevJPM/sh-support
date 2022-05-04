@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs
+    fmt, fs
 };
 
 use contracts::debug_invariant;
@@ -8,7 +8,8 @@ use itertools::Itertools;
 use repl_rs::{Convert, Value};
 
 use crate::{
-    error::Error, information::Information, secret_role::SecretRole, Context, PlayerID, PlayerInfo
+    deck::parse_pattern, error::Error, information::Information, policy::Policy,
+    secret_role::SecretRole, Context, PlayerID
 };
 
 mod filter_engine;
@@ -20,7 +21,8 @@ pub(crate) struct PlayerState {
     num_regular_fascists : usize,
     available_information : Vec<Information>,
     current_roles : Vec<BTreeMap<PlayerID, SecretRole>>,
-    player_info : BTreeMap<PlayerID, PlayerInfo>
+    player_info : BTreeMap<PlayerID, PlayerInfo>,
+    governments : Vec<Government>
 }
 
 impl PlayerState {
@@ -44,6 +46,35 @@ impl PlayerState {
                     && valid_role_assignments(ra, &self.available_information, true, true).is_ok()
             })
             && self.current_roles.iter().all_unique()
+            && self.player_info.iter().all(|(pid, pi)| pid == &pi.seat)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Government {
+    president : PlayerID,
+    chancellor : PlayerID,
+    president_claimed_blues : usize,
+    chancellor_claimed_blues : usize,
+    conflict : bool,
+    policy_passed : Policy,
+    killed_player : Option<PlayerID>
+}
+
+#[derive(Debug, Clone)]
+struct PlayerInfo {
+    seat : PlayerID,
+    name : String
+}
+
+impl fmt::Display for PlayerInfo {
+    fn fmt(&self, f : &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.name.is_empty() {
+            write!(f, "{}", self.seat)
+        }
+        else {
+            write!(f, "{} {{{}}}", self.name, self.seat)
+        }
     }
 }
 
@@ -53,8 +84,7 @@ pub(crate) fn roles(
     context : &mut Context
 ) -> Result<Option<String>, Error> {
     let mut player_state = &mut context.player_state;
-    player_state.current_roles.clear();
-    player_state.available_information.clear();
+    *player_state = PlayerState::default();
 
     let num_lib : usize = args["num_lib"].convert()?;
     let num_fasc : usize = args["num_fasc"].convert()?;
@@ -64,7 +94,15 @@ pub(crate) fn roles(
     player_state.num_regular_fascists = num_fasc;
     player_state.player_info = (1..=table_size)
         .into_iter()
-        .map(|pid| (pid, "".to_string()))
+        .map(|pid| {
+            (
+                pid,
+                PlayerInfo {
+                    seat : pid,
+                    name : String::new()
+                }
+            )
+        })
         .collect();
 
     player_state.current_roles = (0..num_fasc + num_lib)
@@ -436,21 +474,25 @@ pub(crate) fn liberal_percent(
 }
 
 fn format_name(pid : usize, players : &BTreeMap<PlayerID, PlayerInfo>) -> String {
-    if let Some(name) = players.get(&pid) {
-        if name.is_empty() {
-            format!("{pid}")
-        }
-        else {
-            format!("{pid}. {}", name)
-        }
-    }
-    else {
-        format!("{pid}")
+    players
+        .get(&pid)
+        .map(|p| format!("{p}"))
+        .unwrap_or(format!("{pid}"))
+}
+
+fn generate_claim_pattern_from_blues(blues : usize) -> String {
+    match blues {
+        0 => "RRR".to_string(),
+        1 => "RRB".to_string(),
+        2 => "RBB".to_string(),
+        3 => "BBB".to_string(),
+        _ => unreachable!()
     }
 }
 
 fn generate_dot_report(
     information : &Vec<Information>,
+    governments : &[Government],
     players : &BTreeMap<PlayerID, PlayerInfo>
 ) -> String {
     let mut node_attributes : BTreeMap<PlayerID, Vec<Information>> = BTreeMap::new();
@@ -461,12 +503,38 @@ fn generate_dot_report(
 
     let display_name = |pid| format_name(pid, players);
 
+    for (index, gov) in governments.iter().enumerate() {
+        let mut chancellor_claim = generate_claim_pattern_from_blues(gov.chancellor_claimed_blues);
+        chancellor_claim.remove(0);
+        statements.push(format!(
+            "{}->{} [label={},color={},dir={},taillabel={},headlabel={}]",
+            gov.president,
+            gov.chancellor,
+            index + 1,
+            if gov.policy_passed == Policy::Liberal {
+                "blue"
+            }
+            else {
+                "red"
+            },
+            if gov.conflict { "both" } else { "none" },
+            generate_claim_pattern_from_blues(gov.president_claimed_blues),
+            chancellor_claim
+        ));
+        if let Some(killed_player) = gov.killed_player {
+            statements.push(format!(
+                "{}->{} [label=killed, arrowhead=open]",
+                gov.president, killed_player,
+            ));
+        }
+    }
+
     for info in information {
         match info {
             Information::ConfirmedNotHitler(pid) => {
                 node_attributes.entry(*pid).or_default().push(*info)
             },
-            Information::PolicyConflict(left, right) => {
+            Information::PolicyConflict(left, right) if governments.is_empty() => {
                 statements.push(format!("{left} -> {right} [dir=both,color=red]"))
             },
             Information::LiberalInvestigation {
@@ -477,7 +545,8 @@ fn generate_dot_report(
                 investigator,
                 investigatee
             } => statements.push(format!("{investigator} -> {investigatee} [color=red]")),
-            Information::HardFact(pid, _) => node_attributes.entry(*pid).or_default().push(*info)
+            Information::HardFact(pid, _) => node_attributes.entry(*pid).or_default().push(*info),
+            _ => {}
         }
     }
 
@@ -517,6 +586,7 @@ pub(crate) fn graph(
 
     let file_content = generate_dot_report(
         &player_state.available_information,
+        &player_state.governments,
         &player_state.player_info
     );
 
@@ -535,13 +605,106 @@ pub(crate) fn name(
     let position : usize = args["position"].convert()?;
     let name : String = args["display_name"].convert()?;
 
-    *context
+    context
         .player_state
         .player_info
         .get_mut(&position)
-        .ok_or(Error::BadPlayerID(position))? = name.clone();
+        .ok_or(Error::BadPlayerID(position))?
+        .name = name.clone();
 
     Ok(Some(format!(
         "Successfully registered the name {name} for player {position}."
     )))
+}
+
+#[debug_invariant(context.invariant())]
+pub(crate) fn add_government(
+    args : HashMap<String, Value>,
+    context : &mut Context
+) -> Result<Option<String>, Error> {
+    let player_state = &mut context.player_state;
+    let president : usize = args["president"].convert()?;
+    let chancellor : usize = args["chancellor"].convert()?;
+    let presidential_pattern : String = args["presidential_blues"].convert()?;
+    let chancellor_pattern : String = args["chancellor_blues"].convert()?;
+    let killed_player : usize = args["killed_player"].convert()?;
+    let killed_player = if killed_player == 0 {
+        None
+    }
+    else {
+        Some(killed_player)
+    };
+    //let mut conflict : bool = args["conflict"].convert()?;
+
+    let president_claimed_blues = parse_pattern(presidential_pattern, 3, 3)?.0;
+    let chancellor_claimed_blues = parse_pattern(chancellor_pattern, 2, 2)?.0;
+
+    let conflict = president_claimed_blues > 0 && chancellor_claimed_blues == 0;
+
+    if !player_state.player_info.contains_key(&president) {
+        return Err(Error::BadPlayerID(president));
+    }
+    if !player_state.player_info.contains_key(&chancellor) {
+        return Err(Error::BadPlayerID(chancellor));
+    }
+    if let Some(killed_player) = killed_player {
+        if !player_state.player_info.contains_key(&killed_player) {
+            return Err(Error::BadPlayerID(killed_player));
+        }
+    }
+
+    player_state.governments.push(Government {
+        president,
+        chancellor,
+        president_claimed_blues,
+        chancellor_claimed_blues,
+        conflict,
+        policy_passed : if (conflict && president_claimed_blues > 0) || president_claimed_blues == 0
+        {
+            Policy::Fascist
+        }
+        else {
+            Policy::Liberal
+        },
+        killed_player
+    });
+
+    if conflict {
+        player_state
+            .available_information
+            .push(Information::PolicyConflict(president, chancellor));
+    }
+
+    if let Some(killed_player) = killed_player {
+        player_state
+            .available_information
+            .push(Information::ConfirmedNotHitler(killed_player));
+    }
+
+    Ok(Some(format!(
+        "Successfully added a government with president {president} (claimed \
+         {president_claimed_blues} blues) and chancellor {chancellor} (claimed \
+         {chancellor_claimed_blues} blues)."
+    )))
+}
+
+#[debug_invariant(context.invariant())]
+pub(crate) fn pop_government(
+    _args : HashMap<String, Value>,
+    context : &mut Context
+) -> Result<Option<String>, Error> {
+    let removed = context.player_state.governments.pop();
+
+    if let Some(removed) = removed {
+        Ok(Some(format!(
+            "Successfully removed the last government with president {} and chancellor {}.",
+            format_name(removed.president, &context.player_state.player_info),
+            format_name(removed.chancellor, &context.player_state.player_info)
+        )))
+    }
+    else {
+        Ok(Some(
+            "Successfully removed no government because none existed.".to_string()
+        ))
+    }
 }

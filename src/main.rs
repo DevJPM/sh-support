@@ -26,7 +26,6 @@ impl Context {
 }
 
 type PlayerID = usize;
-type PlayerInfo = String;
 
 fn exit(_args : HashMap<String, Value>, _context : &mut Context) -> Result<Option<String>, Error> {
     std::process::exit(0);
@@ -180,6 +179,27 @@ fn main() -> Result<(), Error> {
                 .with_parameter(Parameter::new("position").set_required(true)?)?
                 .with_parameter(Parameter::new("display_name").set_required(true)?)?
                 .with_help("Names a player for nicer reading.")
+        )
+        .add_command(
+            Command::new("government", add_government)
+                .with_parameter(Parameter::new("president").set_required(true)?)?
+                .with_parameter(Parameter::new("chancellor").set_required(true)?)?
+                .with_parameter(Parameter::new("presidential_blues").set_required(true)?)?
+                .with_parameter(Parameter::new("chancellor_blues").set_required(true)?)?
+                .with_parameter(
+                    Parameter::new("killed_player")
+                        .set_required(false)?
+                        .set_default("0")?
+                )?
+                .with_help(
+                    "Logs a government with president, chancellor and claims. Conflicts are \
+                     detected by the president claiming a non-0 amount of blue policies and the \
+                     chancellor claiming 0. Conflicts are automatically registered for analysis."
+                )
+        )
+        .add_command(
+            Command::new("pop_government", pop_government)
+                .with_help("Removes the latest government from the state.")
         )
         .run()?)
 }
