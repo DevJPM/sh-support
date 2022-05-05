@@ -6,13 +6,13 @@ pub(crate) enum Error {
     BadPlayerID(PlayerID),
     ParsePolicyError(String),
     ParseRoleError(String),
+    ParseNameError(String),
     FileSystemError(io::Error),
     TooLongPatternError { have : usize, requested : usize },
     TooShortPatternError { have : usize, requested : usize },
     ReplError(repl_rs::Error),
     LogicalInconsistency,
-    BadFactIndex(usize)
-    //ImpossibleConflict
+    BadFactIndex(usize) //ImpossibleConflict
 }
 
 impl From<repl_rs::Error> for Error {
@@ -53,11 +53,10 @@ impl fmt::Display for Error {
                 f,
                 "Detected a logical inconsistency, check your fact database to debug it."
             ),
+            Error::ParseNameError(name) => {
+                write!(f, "Failed to associate \"{name}\" with a player's name.")
+            },
             Error::BadFactIndex(index) => write!(f, "Fact #{index} does not exist.")
-            /* Error::ImpossibleConflict => write!(
-                f,
-                "It's impossible for a conflict to occur with RRR presidential claims."
-            )*/
         }
     }
 }

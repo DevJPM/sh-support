@@ -50,6 +50,61 @@ impl PlayerState {
     }
 }
 
+fn parse_player_name(
+    input : &str,
+    registered_names : &BTreeMap<PlayerID, PlayerInfo>
+) -> Result<PlayerID, Error> {
+    if let Ok(numerical_indicator) = input.parse::<PlayerID>() {
+        return Ok(numerical_indicator);
+    }
+
+    let input = input.to_lowercase();
+    let registered_names = registered_names.clone();
+
+    let sorted_by_score = registered_names
+        .into_iter()
+        .map(|(_id, pi)| pi)
+        .map(|mut pi| {
+            pi.name = pi.name.to_lowercase();
+            pi
+        })
+        .filter(|pi| !pi.name.is_empty())
+        .map(|pi| {
+            let score = strsim::damerau_levenshtein(&input, &pi.name);
+            (pi, score)
+        })
+        .sorted_by_key(|(_pi, score)| *score)
+        .take(2)
+        .collect_vec();
+
+    if sorted_by_score.is_empty() {
+        Err(Error::ParseNameError(input))
+    }
+    else if sorted_by_score.len() == 1 {
+        let (pinfo, score) = &sorted_by_score[0];
+        if *score >= 4 {
+            Err(Error::ParseNameError(input))
+        }
+        else {
+            Ok(pinfo.seat)
+        }
+    }
+    else if sorted_by_score.len() == 2 {
+        let (pinfo, score) = &sorted_by_score[0];
+        let (_, backup_score) = &sorted_by_score[1];
+
+        if backup_score.saturating_sub(2) < *score && *score != 0 {
+            Err(Error::ParseNameError(input))
+        }
+        else {
+            Ok(pinfo.seat)
+        }
+    }
+    else {
+        unreachable!()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Government {
     president : PlayerID,
@@ -189,7 +244,8 @@ pub(crate) fn add_hard_fact(
     context : &mut Context
 ) -> Result<Option<String>, Error> {
     let mut player_state = &mut context.player_state;
-    let factual_position : PlayerID = args["player_position"].convert()?;
+    let factual_position : String = args["player_position"].convert()?;
+    let factual_position = parse_player_name(&factual_position, &player_state.player_info)?;
     let factual_role : String = args["role"].convert()?;
     let factual_role : SecretRole = factual_role.parse()?;
 
@@ -214,8 +270,10 @@ pub(crate) fn add_conflict(
     context : &mut Context
 ) -> Result<Option<String>, Error> {
     let mut player_state = &mut context.player_state;
-    let president : PlayerID = args["president"].convert()?;
-    let chancellor : PlayerID = args["chancellor"].convert()?;
+    let president : String = args["president"].convert()?;
+    let president = parse_player_name(&president, &player_state.player_info)?;
+    let chancellor : String = args["chancellor"].convert()?;
+    let chancellor = parse_player_name(&chancellor, &player_state.player_info)?;
 
     if !player_state.player_info.contains_key(&president) {
         return Err(Error::BadPlayerID(president));
@@ -242,8 +300,10 @@ pub(crate) fn liberal_investigation(
     context : &mut Context
 ) -> Result<Option<String>, Error> {
     let mut player_state = &mut context.player_state;
-    let investigator : PlayerID = args["investigator"].convert()?;
-    let investigatee : PlayerID = args["investigatee"].convert()?;
+    let investigator : String = args["investigator"].convert()?;
+    let investigator = parse_player_name(&investigator, &player_state.player_info)?;
+    let investigatee : String = args["investigatee"].convert()?;
+    let investigatee = parse_player_name(&investigatee, &player_state.player_info)?;
 
     if !player_state.player_info.contains_key(&investigator) {
         return Err(Error::BadPlayerID(investigator));
@@ -273,8 +333,10 @@ pub(crate) fn fascist_investigation(
     context : &mut Context
 ) -> Result<Option<String>, Error> {
     let mut player_state = &mut context.player_state;
-    let investigator : PlayerID = args["investigator"].convert()?;
-    let investigatee : PlayerID = args["investigatee"].convert()?;
+    let investigator : String = args["investigator"].convert()?;
+    let investigator = parse_player_name(&investigator, &player_state.player_info)?;
+    let investigatee : String = args["investigatee"].convert()?;
+    let investigatee = parse_player_name(&investigatee, &player_state.player_info)?;
 
     if !player_state.player_info.contains_key(&investigator) {
         return Err(Error::BadPlayerID(investigator));
@@ -304,7 +366,8 @@ pub(crate) fn confirm_not_hitler(
     context : &mut Context
 ) -> Result<Option<String>, Error> {
     let mut player_state = &mut context.player_state;
-    let player : PlayerID = args["player"].convert()?;
+    let player : String = args["player"].convert()?;
+    let player = parse_player_name(&player, &player_state.player_info)?;
 
     if !player_state.player_info.contains_key(&player) {
         return Err(Error::BadPlayerID(player));
@@ -623,8 +686,10 @@ pub(crate) fn add_government(
     context : &mut Context
 ) -> Result<Option<String>, Error> {
     let player_state = &mut context.player_state;
-    let president : usize = args["president"].convert()?;
-    let chancellor : usize = args["chancellor"].convert()?;
+    let president : String = args["president"].convert()?;
+    let president = parse_player_name(&president, &player_state.player_info)?;
+    let chancellor : String = args["chancellor"].convert()?;
+    let chancellor = parse_player_name(&chancellor, &player_state.player_info)?;
     let presidential_pattern : String = args["presidential_blues"].convert()?;
     let chancellor_pattern : String = args["chancellor_blues"].convert()?;
     let killed_player : usize = args["killed_player"].convert()?;
