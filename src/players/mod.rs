@@ -747,9 +747,10 @@ pub(crate) fn add_government(
     }
 
     Ok(Some(format!(
-        "Successfully added a government with president {president} (claimed \
-         {president_claimed_blues} blues) and chancellor {chancellor} (claimed \
-         {chancellor_claimed_blues} blues)."
+        "Successfully added a government with president {} (claimed {president_claimed_blues} \
+         blues) and chancellor {} (claimed {chancellor_claimed_blues} blues).",
+        format_name(president, &player_state.player_info),
+        format_name(chancellor, &player_state.player_info),
     )))
 }
 
