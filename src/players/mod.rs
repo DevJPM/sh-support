@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fmt, fs
+    fmt, fs,
+    ops::Deref,
+    process::{Command, Stdio},
+    rc::Rc
 };
 
 use contracts::debug_invariant;
@@ -15,14 +18,61 @@ use crate::{
 mod filter_engine;
 use filter_engine::*;
 
+type Callback = Rc<dyn Fn(&PlayerState, bool)>;
+
+struct CallBackVec<T> {
+    data : Vec<T>,
+    callback : Callback
+}
+
+impl<T> Deref for CallBackVec<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target { &self.data }
+}
+
+impl<T> Default for CallBackVec<T> {
+    fn default() -> Self {
+        Self {
+            data : Default::default(),
+            callback : Rc::new(|_, _| {})
+        }
+    }
+}
+
+impl<T : fmt::Debug> fmt::Debug for CallBackVec<T> {
+    fn fmt(&self, f : &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallBackVec")
+            .field("data", &self.data)
+            .finish()
+    }
+}
+
+impl<T> CallBackVec<T> {
+    #[must_use]
+    fn push(&mut self, item : T) -> Callback {
+        self.data.push(item);
+        Rc::clone(&self.callback)
+    }
+
+    #[must_use]
+    fn pop(&mut self) -> Option<Callback> { self.data.pop().map(|_| Rc::clone(&self.callback)) }
+
+    #[must_use]
+    fn remove(&mut self, index : usize) -> Callback {
+        self.data.remove(index);
+        Rc::clone(&self.callback)
+    }
+}
+
 #[derive(Default, Debug)]
 pub(crate) struct PlayerState {
     table_size : usize,
     num_regular_fascists : usize,
-    available_information : Vec<Information>,
+    available_information : CallBackVec<Information>,
     current_roles : Vec<BTreeMap<PlayerID, SecretRole>>,
     player_info : BTreeMap<PlayerID, PlayerInfo>,
-    governments : Vec<Government>
+    governments : CallBackVec<Government>
 }
 
 impl PlayerState {
@@ -255,7 +305,7 @@ pub(crate) fn add_hard_fact(
 
     player_state
         .available_information
-        .push(Information::HardFact(factual_position, factual_role));
+        .push(Information::HardFact(factual_position, factual_role))(player_state, true);
 
     Ok(Some(format!(
         "Successfully added the information that player {} is {} to the fact database.",
@@ -285,7 +335,7 @@ pub(crate) fn add_conflict(
 
     player_state
         .available_information
-        .push(Information::PolicyConflict(president, chancellor));
+        .push(Information::PolicyConflict(president, chancellor))(player_state, true);
 
     Ok(Some(format!(
         "Successfully added the conflict between {} and {} to the fact database.",
@@ -318,7 +368,7 @@ pub(crate) fn liberal_investigation(
         .push(Information::LiberalInvestigation {
             investigator,
             investigatee
-        });
+        })(player_state, true);
 
     Ok(Some(format!(
         "Successfully added the liberal investigation of {} on {} to the fact database.",
@@ -351,7 +401,7 @@ pub(crate) fn fascist_investigation(
         .push(Information::FascistInvestigation {
             investigator,
             investigatee
-        });
+        })(player_state, true);
 
     Ok(Some(format!(
         "Successfully added the fascist investigation of {} on {} to the fact database.",
@@ -375,7 +425,7 @@ pub(crate) fn confirm_not_hitler(
 
     player_state
         .available_information
-        .push(Information::ConfirmedNotHitler(player));
+        .push(Information::ConfirmedNotHitler(player))(player_state, true);
 
     Ok(Some(format!(
         "Successfully added the confirmation that player {} is not Hitler to the database.",
@@ -398,7 +448,7 @@ pub(crate) fn remove_fact(
     context
         .player_state
         .available_information
-        .remove(factual_position - 1);
+        .remove(factual_position - 1)(&context.player_state, true);
 
     Ok(Some(format!(
         "Successfully removed the fact #{factual_position} from the database."
@@ -639,24 +689,98 @@ fn generate_dot_report(
     format!("digraph {{{statements}}}")
 }
 
-#[debug_invariant(context.invariant())]
+enum InvocationStrategy {
+    Bash,
+    Directly,
+    None
+}
+
+//#[debug_invariant(context.invariant())]
 pub(crate) fn graph(
     args : HashMap<String, Value>,
     context : &mut Context
 ) -> Result<Option<String>, Error> {
-    let mut player_state = &mut context.player_state;
+    //let mut player_state = &mut context.player_state;
     let filename : String = args["filename"].convert()?;
+    let resp_filename = filename.clone();
+    let auto_update : bool = args["auto"].convert()?;
+    let executable : String = args["dot-invocation"].convert()?;
+    let executable_l = executable.to_lowercase();
 
-    let file_content = generate_dot_report(
-        &player_state.available_information,
-        &player_state.governments,
-        &player_state.player_info
-    );
+    let dotfile = format!("{filename}.dot");
 
-    fs::write(format!("{filename}.dot"), file_content)?;
+    let options = vec![
+        "-Tpng".to_string(),
+        "-o".to_string(),
+        format!("{filename}.png"),
+        dotfile.clone(),
+    ];
+
+    let strategy = match executable_l.as_str() {
+        "bash" => InvocationStrategy::Bash,
+        "dot" => InvocationStrategy::Directly,
+        "" => InvocationStrategy::None,
+        _ => return Err(Error::BadExecutable(executable))
+    };
+
+    let baseline_command = executable_l;
+
+    context.player_state.available_information.callback = Rc::new(move |ps, auto| {
+        if !auto || auto_update {
+            let file_content = generate_dot_report(
+                ps.available_information.deref(),
+                ps.governments.deref(),
+                &ps.player_info
+            );
+
+            let dotfile = format!("{filename}.dot");
+
+            if let Err(err) = fs::write(&dotfile, file_content) {
+                return eprintln!("{err}");
+            }
+
+            let mut command = Command::new(&baseline_command);
+
+            match strategy {
+                InvocationStrategy::None => return,
+                InvocationStrategy::Bash => command.arg("-c").arg(format!("\"dot\"")),
+                InvocationStrategy::Directly => &command
+            };
+
+            match command
+                .args(&options)
+                .stdin(Stdio::null())
+                .stderr(Stdio::piped())
+                .stdout(Stdio::piped())
+                .output()
+            {
+                Ok(dot_process) => {
+                    if !dot_process.stdout.is_empty() {
+                        return eprintln!(
+                            "unexpected output from {baseline_command}: {}",
+                            String::from_utf8_lossy(&dot_process.stdout)
+                        );
+                    }
+                    if !dot_process.stderr.is_empty() {
+                        return eprintln!(
+                            "unexpected error from {baseline_command}: {}",
+                            String::from_utf8_lossy(&dot_process.stderr)
+                        );
+                    }
+                },
+                Err(err) => return eprintln!("{err}")
+            };
+            if let Err(err) = fs::remove_file(&dotfile) {
+                return eprintln!("{err}");
+            }
+        }
+    });
+    context.player_state.governments.callback =
+        Rc::clone(&context.player_state.available_information.callback);
+    context.player_state.governments.callback.clone()(&context.player_state, false);
 
     Ok(Some(format!(
-        "Run \"dot -Tpng -o {filename}.png {filename}.dot\" to generate the graph."
+        "Run \"dot -Tpng -o {resp_filename}.png {resp_filename}.dot\" to generate the graph."
     )))
 }
 
@@ -732,18 +856,18 @@ pub(crate) fn add_government(
             Policy::Liberal
         },
         killed_player
-    });
+    })(player_state, true);
 
     if conflict {
         player_state
             .available_information
-            .push(Information::PolicyConflict(president, chancellor));
+            .push(Information::PolicyConflict(president, chancellor))(player_state, true);
     }
 
     if let Some(killed_player) = killed_player {
         player_state
             .available_information
-            .push(Information::ConfirmedNotHitler(killed_player));
+            .push(Information::ConfirmedNotHitler(killed_player))(player_state, true);
     }
 
     Ok(Some(format!(
@@ -759,14 +883,22 @@ pub(crate) fn pop_government(
     _args : HashMap<String, Value>,
     context : &mut Context
 ) -> Result<Option<String>, Error> {
-    let removed = context.player_state.governments.pop();
+    let last = context.player_state.governments.last().cloned();
 
-    if let Some(removed) = removed {
-        Ok(Some(format!(
-            "Successfully removed the last government with president {} and chancellor {}.",
-            format_name(removed.president, &context.player_state.player_info),
-            format_name(removed.chancellor, &context.player_state.player_info)
-        )))
+    let callback = context.player_state.governments.pop();
+
+    if let Some(removed) = last {
+        if let Some(callback) = callback {
+            callback(&context.player_state, true);
+            Ok(Some(format!(
+                "Successfully removed the last government with president {} and chancellor {}.",
+                format_name(removed.president, &context.player_state.player_info),
+                format_name(removed.chancellor, &context.player_state.player_info)
+            )))
+        }
+        else {
+            unreachable!()
+        }
     }
     else {
         Ok(Some(

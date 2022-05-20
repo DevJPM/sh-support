@@ -3,6 +3,7 @@ use std::{fmt, io, str};
 
 #[derive(Debug)]
 pub(crate) enum Error {
+    BadExecutable(String),
     BadPlayerID(PlayerID),
     ParsePolicyError(String),
     ParseRoleError(String),
@@ -56,7 +57,11 @@ impl fmt::Display for Error {
             Error::ParseNameError(name) => {
                 write!(f, "Failed to associate \"{name}\" with a player's name.")
             },
-            Error::BadFactIndex(index) => write!(f, "Fact #{index} does not exist.")
+            Error::BadFactIndex(index) => write!(f, "Fact #{index} does not exist."),
+            Error::BadExecutable(executable) => write!(
+                f,
+                "Found an unexpected dot invocation strategy in {executable}."
+            )
         }
     }
 }

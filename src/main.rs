@@ -172,7 +172,22 @@ fn main() -> Result<(), Error> {
         .add_command(
             Command::new("graph", graph)
                 .with_parameter(Parameter::new("filename").set_required(true)?)?
-                .with_help("Generates the graphviz graph.")
+                .with_parameter(
+                    Parameter::new("auto")
+                        .set_required(false)?
+                        .set_default("false")?
+                )?
+                .with_parameter(
+                    Parameter::new("dot-invocation")
+                        .set_required(false)?
+                        .set_default("")?
+                )?
+                .with_help(
+                    "Generates the graphviz graph. If \"auto\" is set to true, updates the .dot \
+                     file automatically. If \"dot-invocation\" is also supplied it will also \
+                     generate the .png automatically and remove the .dot file, example values \
+                     include \"dot\" and \"bash\"."
+                )
         )
         .add_command(
             Command::new("name", name)
