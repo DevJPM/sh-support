@@ -10,3 +10,5 @@ repl-rs = "^0.2"
 itertools = "^0.10"
 contracts = "^0.6"
 strsim = "^0.10"
+arboard = "^2"
+image = { version = "^0.24", default-features = false, features = ["bmp", "png"] }

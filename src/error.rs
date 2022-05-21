@@ -1,9 +1,16 @@
+use image::ImageError;
+
 use crate::PlayerID;
 use std::{fmt, io, str};
 
 #[derive(Debug)]
 pub(crate) enum Error {
     BadExecutable(String),
+    UnexpectedStdout(Vec<u8>),
+    UnexpectedStderr(Vec<u8>),
+    ImageError(ImageError),
+    EncodingError,
+    ClipBoardError(arboard::Error),
     BadPlayerID(PlayerID),
     ParsePolicyError(String),
     ParseRoleError(String),
@@ -26,6 +33,14 @@ impl From<str::Utf8Error> for Error {
 
 impl From<io::Error> for Error {
     fn from(error : io::Error) -> Self { Error::FileSystemError(error) }
+}
+
+impl From<ImageError> for Error {
+    fn from(e : ImageError) -> Self { Error::ImageError(e) }
+}
+
+impl From<arboard::Error> for Error {
+    fn from(e : arboard::Error) -> Self { Error::ClipBoardError(e) }
 }
 
 impl fmt::Display for Error {
@@ -61,6 +76,22 @@ impl fmt::Display for Error {
             Error::BadExecutable(executable) => write!(
                 f,
                 "Found an unexpected dot invocation strategy in {executable}."
+            ),
+            Error::UnexpectedStdout(out) => write!(
+                f,
+                "Found an unexpected stdout output: {}",
+                String::from_utf8_lossy(out)
+            ),
+            Error::UnexpectedStderr(err) => write!(
+                f,
+                "Found an unexpected stderr output: {}",
+                String::from_utf8_lossy(err)
+            ),
+            Error::ImageError(e) => write!(f, "{e}"),
+            Error::ClipBoardError(e) => write!(f, "{e}"),
+            Error::EncodingError => write!(
+                f,
+                "Failed to encode the output png image into the format for the clipboard."
             )
         }
     }

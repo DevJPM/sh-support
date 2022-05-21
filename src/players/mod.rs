@@ -6,7 +6,9 @@ use std::{
     rc::Rc
 };
 
+use arboard::{Clipboard, ImageData};
 use contracts::debug_invariant;
+use image::EncodableLayout;
 use itertools::Itertools;
 use repl_rs::{Convert, Value};
 
@@ -18,7 +20,7 @@ use crate::{
 mod filter_engine;
 use filter_engine::*;
 
-type Callback = Rc<dyn Fn(&PlayerState, bool)>;
+type Callback = Rc<dyn Fn(&PlayerState, bool) -> Result<(), Error>>;
 
 struct CallBackVec<T> {
     data : Vec<T>,
@@ -35,7 +37,7 @@ impl<T> Default for CallBackVec<T> {
     fn default() -> Self {
         Self {
             data : Default::default(),
-            callback : Rc::new(|_, _| {})
+            callback : Rc::new(|_, _| Ok(()))
         }
     }
 }
@@ -305,7 +307,7 @@ pub(crate) fn add_hard_fact(
 
     player_state
         .available_information
-        .push(Information::HardFact(factual_position, factual_role))(player_state, true);
+        .push(Information::HardFact(factual_position, factual_role))(player_state, true)?;
 
     Ok(Some(format!(
         "Successfully added the information that player {} is {} to the fact database.",
@@ -335,7 +337,7 @@ pub(crate) fn add_conflict(
 
     player_state
         .available_information
-        .push(Information::PolicyConflict(president, chancellor))(player_state, true);
+        .push(Information::PolicyConflict(president, chancellor))(player_state, true)?;
 
     Ok(Some(format!(
         "Successfully added the conflict between {} and {} to the fact database.",
@@ -368,7 +370,7 @@ pub(crate) fn liberal_investigation(
         .push(Information::LiberalInvestigation {
             investigator,
             investigatee
-        })(player_state, true);
+        })(player_state, true)?;
 
     Ok(Some(format!(
         "Successfully added the liberal investigation of {} on {} to the fact database.",
@@ -401,7 +403,7 @@ pub(crate) fn fascist_investigation(
         .push(Information::FascistInvestigation {
             investigator,
             investigatee
-        })(player_state, true);
+        })(player_state, true)?;
 
     Ok(Some(format!(
         "Successfully added the fascist investigation of {} on {} to the fact database.",
@@ -425,7 +427,7 @@ pub(crate) fn confirm_not_hitler(
 
     player_state
         .available_information
-        .push(Information::ConfirmedNotHitler(player))(player_state, true);
+        .push(Information::ConfirmedNotHitler(player))(player_state, true)?;
 
     Ok(Some(format!(
         "Successfully added the confirmation that player {} is not Hitler to the database.",
@@ -448,7 +450,7 @@ pub(crate) fn remove_fact(
     context
         .player_state
         .available_information
-        .remove(factual_position - 1)(&context.player_state, true);
+        .remove(factual_position - 1)(&context.player_state, true)?;
 
     Ok(Some(format!(
         "Successfully removed the fact #{factual_position} from the database."
@@ -708,11 +710,12 @@ pub(crate) fn graph(
     let executable_l = executable.to_lowercase();
 
     let dotfile = format!("{filename}.dot");
+    let imagefile = format!("{filename}.png");
 
     let options = vec![
         "-Tpng".to_string(),
         "-o".to_string(),
-        format!("{filename}.png"),
+        imagefile.clone(),
         dotfile.clone(),
     ];
 
@@ -735,49 +738,47 @@ pub(crate) fn graph(
 
             let dotfile = format!("{filename}.dot");
 
-            if let Err(err) = fs::write(&dotfile, file_content) {
-                return eprintln!("{err}");
-            }
+            fs::write(&dotfile, file_content)?;
 
             let mut command = Command::new(&baseline_command);
 
             match strategy {
-                InvocationStrategy::None => return,
+                InvocationStrategy::None => return Ok(()),
                 InvocationStrategy::Bash => command.arg("-c").arg(format!("\"dot\"")),
                 InvocationStrategy::Directly => &command
             };
 
-            match command
+            let dot_process = command
                 .args(&options)
                 .stdin(Stdio::null())
                 .stderr(Stdio::piped())
                 .stdout(Stdio::piped())
-                .output()
-            {
-                Ok(dot_process) => {
-                    if !dot_process.stdout.is_empty() {
-                        return eprintln!(
-                            "unexpected output from {baseline_command}: {}",
-                            String::from_utf8_lossy(&dot_process.stdout)
-                        );
-                    }
-                    if !dot_process.stderr.is_empty() {
-                        return eprintln!(
-                            "unexpected error from {baseline_command}: {}",
-                            String::from_utf8_lossy(&dot_process.stderr)
-                        );
-                    }
-                },
-                Err(err) => return eprintln!("{err}")
-            };
-            if let Err(err) = fs::remove_file(&dotfile) {
-                return eprintln!("{err}");
+                .output()?;
+
+            if !dot_process.stdout.is_empty() {
+                return Err(Error::UnexpectedStdout(dot_process.stdout));
             }
+            if !dot_process.stderr.is_empty() {
+                return Err(Error::UnexpectedStderr(dot_process.stderr));
+            }
+
+            let image = image::io::Reader::open(&imagefile)?.decode()?;
+            let image = image.as_rgba8().ok_or(Error::EncodingError)?;
+            let mut clipboard = Clipboard::new()?;
+            clipboard.set_image(ImageData {
+                width : image.width() as usize,
+                height : image.height() as usize,
+                bytes : std::borrow::Cow::Borrowed(image.as_bytes())
+            })?;
+
+            fs::remove_file(&dotfile)?;
         }
+
+        Ok(())
     });
     context.player_state.governments.callback =
         Rc::clone(&context.player_state.available_information.callback);
-    context.player_state.governments.callback.clone()(&context.player_state, false);
+    context.player_state.governments.callback.clone()(&context.player_state, false)?;
 
     Ok(Some(format!(
         "Run \"dot -Tpng -o {resp_filename}.png {resp_filename}.dot\" to generate the graph."
@@ -856,18 +857,18 @@ pub(crate) fn add_government(
             Policy::Liberal
         },
         killed_player
-    })(player_state, true);
+    })(player_state, true)?;
 
     if conflict {
         player_state
             .available_information
-            .push(Information::PolicyConflict(president, chancellor))(player_state, true);
+            .push(Information::PolicyConflict(president, chancellor))(player_state, true)?;
     }
 
     if let Some(killed_player) = killed_player {
         player_state
             .available_information
-            .push(Information::ConfirmedNotHitler(killed_player))(player_state, true);
+            .push(Information::ConfirmedNotHitler(killed_player))(player_state, true)?;
     }
 
     Ok(Some(format!(
@@ -889,7 +890,7 @@ pub(crate) fn pop_government(
 
     if let Some(removed) = last {
         if let Some(callback) = callback {
-            callback(&context.player_state, true);
+            callback(&context.player_state, true)?;
             Ok(Some(format!(
                 "Successfully removed the last government with president {} and chancellor {}.",
                 format_name(removed.president, &context.player_state.player_info),
