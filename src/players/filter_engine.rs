@@ -80,7 +80,7 @@ pub(super) fn valid_role_assignments(
         .map(|vb| vb.into_iter().all(|x| x))
 }
 
-pub(super) fn filter_assigned_roles_invonvenient(
+pub(super) fn filter_assigned_roles_inconvenient(
     player_state : &PlayerState,
     allow_fascist_fascist_conflict : bool,
     allow_aggressive_hitler : bool
@@ -113,7 +113,7 @@ pub(super) fn filter_assigned_roles(
     let allow_fascist_fascist_conflict : bool = args["allow_fascist_fascist_conflict"].convert()?;
     let allow_aggressive_hitler : bool = args["allow_aggressive_hitler"].convert()?;
 
-    filter_assigned_roles_invonvenient(
+    filter_assigned_roles_inconvenient(
         player_state,
         allow_fascist_fascist_conflict,
         allow_aggressive_hitler

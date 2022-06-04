@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt, fs,
     ops::Deref,
     process::{Command, Stdio},
@@ -483,12 +483,12 @@ pub(crate) fn debug_filtered_roles(
     ))
 }
 
-#[debug_invariant(context.invariant())]
+//#[debug_invariant(context.invariant())]
 pub(crate) fn impossible_teams(
     args : HashMap<String, Value>,
     context : &mut Context
 ) -> Result<Option<String>, Error> {
-    let mut player_state = &mut context.player_state;
+    let player_state = &mut context.player_state;
     let num_fascists = player_state.num_regular_fascists + 1;
 
     let filtered_assignments = filter_assigned_roles(args, player_state)?;
@@ -499,18 +499,32 @@ pub(crate) fn impossible_teams(
             ra.iter()
                 .filter(|(_pos, role)| role.is_fascist())
                 .map(|(pos, _role)| *pos)
-                .sorted()
-                .collect_vec()
+                .collect::<BTreeSet<_>>()
         })
-        .collect::<HashSet<_>>();
-
-    let all_potential_fascist_teams = (1..=player_state.table_size)
-        .combinations(num_fascists)
-        .filter(|faspos| !legal_fascist_positions.contains(faspos))
         .collect_vec();
 
+    let mut impossible_teams = vec![];
+
+    for impossible_size in 1..=num_fascists {
+        let mut local_impossible = (1..=player_state.table_size)
+            .combinations(impossible_size)
+            .map(|faspos| faspos.into_iter().collect::<BTreeSet<_>>())
+            .filter(|faspos| {
+                !impossible_teams
+                    .iter()
+                    .any(|discovered : &BTreeSet<_>| discovered.is_subset(faspos))
+            })
+            .filter(|faspos| {
+                !legal_fascist_positions
+                    .iter()
+                    .any(|legal_fas| faspos.is_subset(legal_fas))
+            })
+            .collect_vec();
+        impossible_teams.append(&mut local_impossible);
+    }
+
     Ok(Some(
-        all_potential_fascist_teams
+        impossible_teams
             .into_iter()
             .map(|vfas| {
                 vfas.into_iter()
@@ -736,20 +750,19 @@ pub(crate) fn graph(
                 &ps.player_info
             );
 
-            let dotfile = format!("{filename}.dot");
-
             fs::write(&dotfile, file_content)?;
 
             let mut command = Command::new(&baseline_command);
 
             match strategy {
                 InvocationStrategy::None => return Ok(()),
-                InvocationStrategy::Bash => command.arg("-c").arg(format!("\"dot\"")),
-                InvocationStrategy::Directly => &command
+                InvocationStrategy::Bash => command
+                    .arg("-c")
+                    .arg(format! {"\"dot\" {}", options.iter().join(" ")}),
+                InvocationStrategy::Directly => command.args(&options)
             };
 
             let dot_process = command
-                .args(&options)
                 .stdin(Stdio::null())
                 .stderr(Stdio::piped())
                 .stdout(Stdio::piped())
