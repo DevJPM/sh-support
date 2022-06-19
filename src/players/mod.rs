@@ -483,7 +483,7 @@ pub(crate) fn debug_filtered_roles(
     ))
 }
 
-//#[debug_invariant(context.invariant())]
+#[debug_invariant(context.invariant())]
 pub(crate) fn impossible_teams(
     args : HashMap<String, Value>,
     context : &mut Context
@@ -711,7 +711,7 @@ enum InvocationStrategy {
     None
 }
 
-//#[debug_invariant(context.invariant())]
+#[debug_invariant(context.invariant())]
 pub(crate) fn graph(
     args : HashMap<String, Value>,
     context : &mut Context
