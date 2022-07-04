@@ -632,6 +632,8 @@ fn generate_dot_report(
 
     let display_name = |pid| format_name(pid, players);
 
+    let mut handled_conflicts = BTreeSet::new();
+
     for (index, gov) in governments.iter().enumerate() {
         let mut chancellor_claim = generate_claim_pattern_from_blues(gov.chancellor_claimed_blues);
         chancellor_claim.remove(0);
@@ -646,7 +648,13 @@ fn generate_dot_report(
             else {
                 "red"
             },
-            if gov.conflict { "both" } else { "none" },
+            if gov.conflict {
+                handled_conflicts.insert((gov.president, gov.chancellor));
+                "both"
+            }
+            else {
+                "none"
+            },
             generate_claim_pattern_from_blues(gov.president_claimed_blues),
             chancellor_claim
         ));
@@ -663,7 +671,12 @@ fn generate_dot_report(
             Information::ConfirmedNotHitler(pid) => {
                 node_attributes.entry(*pid).or_default().push(*info)
             },
-            Information::PolicyConflict(left, right) if governments.is_empty() => {
+            // only add this, if it was a manual conflict (i.e. if the two nodes don't already have
+            // a gov-based conflict), e.g. to insert deck-peek based conflicts into the graph
+            Information::PolicyConflict(left, right)
+                if !handled_conflicts.contains(&(*left, *right))
+                    && !handled_conflicts.contains(&(*right, *left)) =>
+            {
                 statements.push(format!("{left} -> {right} [dir=both,color=red]"))
             },
             Information::LiberalInvestigation {

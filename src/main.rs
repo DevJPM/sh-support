@@ -31,11 +31,13 @@ fn exit(_args : HashMap<String, Value>, _context : &mut Context) -> Result<Optio
     std::process::exit(0);
 }
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() -> Result<(), Error> {
     Ok(Repl::new(Context::default())
         .use_completion(true)
         .with_description("Tool to assist with computational secret hitler questions.")
-        .with_version("1.0.0")
+        .with_version(VERSION)
         .with_name("sh-tool")
         .add_command(
             Command::new("generate", generate)
