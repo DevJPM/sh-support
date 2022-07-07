@@ -28,11 +28,9 @@ The tool works as a [REPL shell](https://en.wikipedia.org/wiki/Read%E2%80%93eval
 
 ### Computing Draw probabilities
 
-First you need to generate the deck state. The command is `generate <lib count> <fasc count>`, e.g. `generate 6 11` to generate all possible decks containing 6 liberal and 11 fascist policy cards.
+To inspect the possible decks, you can use either the `next` or the `dist` command. Both commands first take `<num lib> <num fasc>` as arguments to specify the amount of liberal and fascist policies in the deck. The `next` command accepts a claim pattern, e.g. `next 6 11 fff` and will find the probability associated with this draw in a with 6 liberal and 11 fascist policies deck state. Note that entering `next 6 11 BRB` will look for 2 blues among the next 3 cards, not for the specific ordering.
 
-To inspect this state, you can use either the `next` or the `dist` command. The `next` command accepts a claim pattern, e.g. `next fff` and will find the probability associated with this draw in the current deck state. Note that entering `next BRB` will look for 2 blues among the next 3 cards, not for the specific ordering.
-
-The `dist` command accepts a positive integer as input, e.g. `dist 3`, and will output the probabilities associated with all possible claim patterns for the next entered number of cards.
+The `dist` command accepts a positive integer as input, e.g. `dist 6 11 3`, and will output the probabilities associated with all possible claim patterns for the next entered number of cards.
 
 ### Tracking and Analyzing Games
 

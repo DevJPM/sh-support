@@ -17,12 +17,11 @@ use players::*;
 
 #[derive(Default, Debug)]
 pub struct Context {
-    deck_state : DeckState,
     player_state : PlayerState
 }
 
 impl Context {
-    fn invariant(&self) -> bool { self.deck_state.invariant() && self.player_state.invariant() }
+    fn invariant(&self) -> bool { self.player_state.invariant() }
 }
 
 type PlayerID = usize;
@@ -31,7 +30,7 @@ fn exit(_args : HashMap<String, Value>, _context : &mut Context) -> Result<Optio
     std::process::exit(0);
 }
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION : &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> Result<(), Error> {
     Ok(Repl::new(Context::default())
@@ -40,33 +39,34 @@ fn main() -> Result<(), Error> {
         .with_version(VERSION)
         .with_name("sh-tool")
         .add_command(
-            Command::new("generate", generate)
+            Command::new("debug_decks", debug_decks)
                 .with_parameter(Parameter::new("num_lib").set_required(true)?)?
                 .with_parameter(Parameter::new("num_fasc").set_required(true)?)?
                 .with_help(
-                    "Generate a deck of specified parameters and store it as the current context."
+                    "Prints out all decks with a specified amount of liberal and fascist cards."
                 )
-        )
-        .add_command(
-            Command::new("debug_decks", debug_decks)
-                .with_help("Prints out all decks in the current context.")
         )
         .add_command(Command::new("exit", exit).with_help("Exits this program."))
         .add_command(Command::new("quit", exit).with_help("Exits this program."))
         .add_command(
             Command::new("next", next)
+                .with_parameter(Parameter::new("num_lib").set_required(true)?)?
+                .with_parameter(Parameter::new("num_fasc").set_required(true)?)?
                 .with_parameter(Parameter::new("pattern").set_required(true)?)?
                 .with_help(
-                    "Computes the probability that the next few cards match the specified card \
+                    "Computes the probability that the next few cards of a deck with the \
+                     specified amount of liberal and fascist cards match the specified card \
                      counts (order is ignored). E.g. \"next BBR\" will match \"BBR,RBB,BRB,...\" "
                 )
         )
         .add_command(
             Command::new("dist", dist)
+                .with_parameter(Parameter::new("num_lib").set_required(true)?)?
+                .with_parameter(Parameter::new("num_fasc").set_required(true)?)?
                 .with_parameter(Parameter::new("window_size").set_required(true)?)?
                 .with_help(
                     "Computes the distribution of claim-like cards within the next window_size \
-                     cards."
+                     cards for a deck with the specified amount of liberal and fascist cards."
                 )
         )
         .add_command(

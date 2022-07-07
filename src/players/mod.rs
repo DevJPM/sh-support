@@ -157,6 +157,21 @@ fn parse_player_name(
     }
 }
 
+fn validate_non_dead(
+    killed_player : usize,
+    governments : &CallBackVec<Government>
+) -> Result<(), Error> {
+    if governments
+        .iter()
+        .any(|g| matches!(g.killed_player, Some(d) if d==killed_player))
+    {
+        Err(Error::DeadPlayerID(killed_player))
+    }
+    else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Government {
     president : PlayerID,
@@ -247,9 +262,10 @@ pub(crate) fn roles(
         .collect_vec();
 
     Ok(Some(format!(
-        "Successfully generated {} role-assignments with {} liberal and {} regular fascist roles \
-         each.",
+        "Successfully generated {} role-assignments ({}-player seat assignments) with {} liberal \
+         and {} regular fascist roles each.",
         player_state.current_roles.len(),
+        table_size,
         num_lib,
         num_fasc
     )))
@@ -527,11 +543,21 @@ pub(crate) fn impossible_teams(
         impossible_teams
             .into_iter()
             .map(|vfas| {
-                vfas.into_iter()
-                    .map(|fpos| format_name(fpos, &player_state.player_info))
-                    .join(" and ")
+                (
+                    vfas.len(),
+                    vfas.into_iter()
+                        .map(|fpos| format_name(fpos, &player_state.player_info))
+                        .join(" and ")
+                )
             })
-            .map(|s| format!("{s} can't ALL be fascists at the same time."))
+            .map(|(pc, s)| {
+                if pc != 1 {
+                    format!("{s} can't ALL be fascists at the same time.")
+                }
+                else {
+                    format!("{s} can't be a fascist.")
+                }
+            })
             .join("\n")
     ))
 }
@@ -807,7 +833,8 @@ pub(crate) fn graph(
     context.player_state.governments.callback.clone()(&context.player_state, false)?;
 
     Ok(Some(format!(
-        "Run \"dot -Tpng -o {resp_filename}.png {resp_filename}.dot\" to generate the graph."
+        "Run \"dot -Tpng -o {resp_filename}.png {resp_filename}.dot\" in a separate shell (e.g. \
+         bash, cmd, powershell, ...) in the current working directory to generate the graph."
     )))
 }
 
@@ -843,13 +870,18 @@ pub(crate) fn add_government(
     let chancellor = parse_player_name(&chancellor, &player_state.player_info)?;
     let presidential_pattern : String = args["presidential_blues"].convert()?;
     let chancellor_pattern : String = args["chancellor_blues"].convert()?;
-    let killed_player : usize = args["killed_player"].convert()?;
-    let killed_player = if killed_player == 0 {
+    let killed_player : String = args["killed_player"].convert()?;
+    let killed_player = if matches!(killed_player.parse::<usize>(), Ok(0)) {
         None
     }
     else {
+        let killed_player = parse_player_name(&killed_player, &player_state.player_info)?;
+        validate_non_dead(killed_player, &player_state.governments)?;
         Some(killed_player)
     };
+
+    validate_non_dead(president, &player_state.governments)?;
+    validate_non_dead(chancellor, &player_state.governments)?;
     //let mut conflict : bool = args["conflict"].convert()?;
 
     let president_claimed_blues = parse_pattern(presidential_pattern, 3, 3)?.0;
@@ -897,9 +929,20 @@ pub(crate) fn add_government(
             .push(Information::ConfirmedNotHitler(killed_player))(player_state, true)?;
     }
 
+    let kill = if let Some(killed_player) = killed_player {
+        format!(
+            " President {} also chose to execute {}.",
+            format_name(president, &player_state.player_info),
+            format_name(killed_player, &player_state.player_info)
+        )
+    }
+    else {
+        "".to_string()
+    };
+
     Ok(Some(format!(
         "Successfully added a government with president {} (claimed {president_claimed_blues} \
-         blues) and chancellor {} (claimed {chancellor_claimed_blues} blues).",
+         blues) and chancellor {} (claimed {chancellor_claimed_blues} blues).{kill}",
         format_name(president, &player_state.player_info),
         format_name(chancellor, &player_state.player_info),
     )))
@@ -918,7 +961,9 @@ pub(crate) fn pop_government(
         if let Some(callback) = callback {
             callback(&context.player_state, true)?;
             Ok(Some(format!(
-                "Successfully removed the last government with president {} and chancellor {}.",
+                "Successfully removed the last government with president {} and chancellor \
+                 {}.\nRemember to also remove automatically derived facts like conflicts and \
+                 non-hitler confirmations for dead people.",
                 format_name(removed.president, &context.player_state.player_info),
                 format_name(removed.chancellor, &context.player_state.player_info)
             )))

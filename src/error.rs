@@ -12,6 +12,7 @@ pub(crate) enum Error {
     EncodingError,
     ClipBoardError(arboard::Error),
     BadPlayerID(PlayerID),
+    DeadPlayerID(PlayerID),
     ParsePolicyError(String),
     ParseRoleError(String),
     ParseNameError(String),
@@ -92,7 +93,8 @@ impl fmt::Display for Error {
             Error::EncodingError => write!(
                 f,
                 "Failed to encode the output png image into the format for the clipboard."
-            )
+            ),
+            Error::DeadPlayerID(killed) => write!(f,"Player {killed} cannot be selected here because they are dead."),
         }
     }
 }
