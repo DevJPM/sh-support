@@ -5,6 +5,7 @@
 ### Installing Rust
 
 Go to [Rustup.rs](https://rustup.rs/) and follow the instructions there to install the compiler for the Rust programming language to compile the code.
+It will require the Visual C++ build tools if you're on Windows. The easiest way to get them is to go to the [Visual Studio download page](https://visualstudio.microsoft.com/downloads/) and then going to the "Tools" section and just downloading the builds tools.
 
 ### Installing Graphviz
 
