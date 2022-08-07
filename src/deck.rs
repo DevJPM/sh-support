@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    str
+    fmt, str
 };
 
 use cached::proc_macro::cached;
@@ -8,12 +8,12 @@ use contracts::{debug_ensures, debug_invariant};
 use itertools::Itertools;
 use repl_rs::{Convert, Value};
 
-use crate::{policy::Policy, Context, Error};
+use crate::{players::ElectionResult, policy::Policy, Context, Error};
 
 #[derive(Default, Debug, Clone)]
 pub(crate) struct DeckState {
-    num_cards : usize,
-    actual_decks : Vec<Vec<Policy>>
+    pub(crate) num_cards : usize,
+    pub(crate) actual_decks : Vec<Vec<Policy>>
 }
 
 impl DeckState {
@@ -32,7 +32,7 @@ fn generate(args : &HashMap<String, Value>) -> Result<DeckState, Error> {
 
 #[cached]
 #[debug_ensures(ret.invariant())]
-fn generate_internal(num_lib : usize, num_fasc : usize) -> DeckState {
+pub(crate) fn generate_internal(num_lib : usize, num_fasc : usize) -> DeckState {
     let num_cards = num_lib + num_fasc;
 
     DeckState {
@@ -94,24 +94,32 @@ pub(crate) fn dist(
     Ok(Some(out_text))
 }
 
-#[debug_ensures(ret.iter().map(|(_k,v)|v).sum::<usize>() == decks.len())]
+//#[debug_ensures(ret.iter().map(|(_k,v)|v).sum::<usize>() == decks.len())]
 fn compute_window_histogram(
     decks : &Vec<Vec<Policy>>,
     window_size : usize
 ) -> BTreeMap<usize, usize> {
     decks
         .iter()
-        .map(|deck| {
-            deck.iter()
-                .take(window_size)
-                .filter(|p| **p == Policy::Liberal)
-                .count()
-        })
+        .map(|d| count_policies(d, 0, window_size, Policy::Liberal))
         .sorted()
         .group_by(|x| *x)
         .into_iter()
         .map(|(k, v)| (k, v.count()))
         .collect()
+}
+
+fn count_policies(
+    deck : &Vec<Policy>,
+    offset : usize,
+    window_size : usize,
+    policy : Policy
+) -> usize {
+    deck.iter()
+        .skip(offset)
+        .take(window_size)
+        .filter(|p| **p == policy)
+        .count()
 }
 
 pub(crate) fn parse_pattern(
@@ -148,36 +156,165 @@ pub(crate) fn parse_pattern(
     Ok((num_lib_in_pattern, pattern_length, pattern))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DeckAnalysis {
+    pub num_decks_matching : usize,
+    pub num_decks_checked : usize
+}
+
+impl DeckAnalysis {
+    pub fn probability(&self) -> f64 {
+        self.num_decks_matching as f64 / self.num_decks_checked as f64
+    }
+}
+
+impl fmt::Display for DeckAnalysis {
+    fn fmt(&self, f : &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:.1}% ({}/{})",
+            self.probability() * 100.0,
+            self.num_decks_matching,
+            self.num_decks_checked
+        )
+    }
+}
+
+#[cached]
+fn hard_facted_complex_card_counter(
+    num_total_lib : usize,
+    num_total_fasc : usize,
+    hard_facts : Vec<ElectionResult>
+) -> DeckState {
+    let decks = generate_internal(num_total_lib, num_total_fasc);
+    DeckState {
+        num_cards : decks.num_cards,
+        actual_decks : decks
+            .actual_decks
+            .into_iter()
+            .filter(|d| {
+                hard_facts
+                    .iter()
+                    .scan(0, |offset, er| {
+                        let (drawn, _discarded) = er.cards_total_drawn_discarded();
+                        let ret = count_policies(d, *offset, drawn, Policy::Liberal)
+                            >= er.passed_blues()
+                            && count_policies(d, *offset, drawn, Policy::Fascist)
+                                >= 1 - er.passed_blues();
+                        *offset += drawn;
+                        Some(ret)
+                    })
+                    .all(|x| x)
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn complex_card_counter(
+    num_total_lib : usize,
+    num_total_fasc : usize,
+    hard_facts : &[&ElectionResult],
+    hypotheses : &[ElectionResult],
+    new_hypothesis : &ElectionResult
+) -> DeckAnalysis {
+    let decks = hard_facted_complex_card_counter(
+        num_total_lib,
+        num_total_fasc,
+        hard_facts.iter().map(|er| (*er).clone()).collect()
+    );
+    let decks = DeckState {
+        num_cards : decks.num_cards,
+        actual_decks : decks
+            .actual_decks
+            .into_iter()
+            .filter(|d| {
+                hypotheses
+                    .iter()
+                    .scan(0, |offset, er| {
+                        let (drawn, _discarded) = er.cards_total_drawn_discarded();
+                        let ret =
+                            count_policies(d, *offset, drawn, Policy::Liberal) == er.seen_blues();
+                        *offset += drawn;
+                        Some(ret)
+                    })
+                    .all(|x| x)
+            })
+            .collect()
+    };
+
+    let target_offset = hypotheses
+        .iter()
+        .map(|er| er.cards_total_drawn_discarded().0)
+        .sum();
+
+    DeckAnalysis {
+        num_decks_matching : decks
+            .actual_decks
+            .iter()
+            .filter(|d| {
+                count_policies(
+                    d,
+                    target_offset,
+                    new_hypothesis.cards_total_drawn_discarded().0,
+                    Policy::Liberal
+                ) == new_hypothesis.seen_blues()
+            })
+            .count(),
+        num_decks_checked : decks.actual_decks.len()
+    }
+}
+
+#[cached]
+pub(crate) fn next_blues_count(
+    num_total_lib : usize,
+    num_total_fasc : usize,
+    window_size : usize,
+    desired_blues_in_window : usize,
+    guaranteed_blues_in_window : usize,
+    guaranteed_reds_in_window : usize
+) -> DeckAnalysis {
+    let decks = generate_internal(num_total_lib, num_total_fasc);
+    let decks = DeckState {
+        num_cards : decks.num_cards,
+        actual_decks : decks
+            .actual_decks
+            .into_iter()
+            .filter(|d| {
+                count_policies(d, 0, window_size, Policy::Liberal) >= guaranteed_blues_in_window
+                    && count_policies(d, 0, window_size, Policy::Fascist)
+                        >= guaranteed_reds_in_window
+            })
+            .collect()
+    };
+
+    DeckAnalysis {
+        num_decks_matching : decks
+            .actual_decks
+            .iter()
+            .filter(|d| {
+                count_policies(d, 0, window_size, Policy::Liberal) == desired_blues_in_window
+            })
+            .count(),
+        num_decks_checked : decks.actual_decks.len()
+    }
+}
+
 #[debug_invariant(_context.invariant())]
 pub(crate) fn next(
     args : HashMap<String, Value>,
     _context : &mut Context
 ) -> Result<Option<String>, Error> {
-    let deck_state = generate(&args)?;
+    let num_lib : usize = args["num_lib"].convert()?;
+    let num_fasc : usize = args["num_fasc"].convert()?;
     let pattern : String = args["pattern"].convert()?;
 
     let (num_lib_in_pattern, pattern_length, pattern) =
-        parse_pattern(pattern, deck_state.num_cards, 0)?;
+        parse_pattern(pattern, num_lib + num_lib, 0)?;
 
-    let num_matching_decks = deck_state
-        .actual_decks
-        .iter()
-        .filter(|d| {
-            d.iter()
-                .take(pattern_length)
-                .filter(|p| **p == Policy::Liberal)
-                .count()
-                == num_lib_in_pattern
-        })
-        .count();
-
-    let probability = (num_matching_decks as f64) / (deck_state.actual_decks.len() as f64);
+    let analysis = next_blues_count(num_lib, num_fasc, pattern_length, num_lib_in_pattern, 0, 0);
 
     Ok(Some(format!(
-        "There is a {:.1}% ({}/{}) chance for the claim pattern {} to match the next {} cards.",
-        probability * 100.0,
-        num_matching_decks,
-        deck_state.actual_decks.len(),
+        "There is a {analysis} chance for the claim pattern {} to match the next {} cards.",
         pattern.iter().map(|p| p.to_string()).join(""),
         pattern_length
     )))

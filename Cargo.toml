@@ -1,6 +1,6 @@
 [package]
 name = "sh-support"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -12,4 +12,9 @@ contracts = "^0.6"
 strsim = "^0.10"
 arboard = "^2"
 image = { version = "^0.24", default-features = false, features = ["bmp", "png"] }
-cached = "^0.36"
+cached = "^0.37"
+serde = {version = "1", features = ["derive"]}
+serde_json = "1"
+readonly = "0.2"
+
+dialoguer = "0.10"

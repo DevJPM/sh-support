@@ -59,7 +59,13 @@ fn universal_deducable_information(
             investigator,
             investigatee
         } => Ok(lp(investigator)?.is_fascist() || lp(investigatee)?.is_fascist()),
-        Information::HardFact(pid, role) => Ok(lp(pid)? == role)
+        Information::HardFact(pid, role) => Ok(lp(pid)? == role),
+        Information::AtLeastOneFascist(vsp) => Ok(vsp
+            .iter()
+            .map(lp)
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|role| role.is_fascist()))
     }
 }
 
@@ -84,14 +90,14 @@ pub(super) fn filter_assigned_roles_inconvenient(
     player_state : &PlayerState,
     allow_fascist_fascist_conflict : bool,
     allow_aggressive_hitler : bool
-) -> Result<Vec<&BTreeMap<usize, SecretRole>>, Error> {
+) -> Result<Vec<BTreeMap<usize, SecretRole>>, Error> {
     let filtered_assignments = player_state
-        .current_roles
-        .iter()
+        .current_roles()
+        .into_iter()
         .filter(|roles| {
             valid_role_assignments(
                 roles,
-                &player_state.available_information,
+                &player_state.collect_information(),
                 !allow_aggressive_hitler,
                 !allow_fascist_fascist_conflict
             )
@@ -109,7 +115,7 @@ pub(super) fn filter_assigned_roles_inconvenient(
 pub(super) fn filter_assigned_roles(
     args : HashMap<String, Value>,
     player_state : &PlayerState
-) -> Result<Vec<&BTreeMap<usize, SecretRole>>, Error> {
+) -> Result<Vec<BTreeMap<usize, SecretRole>>, Error> {
     let allow_fascist_fascist_conflict : bool = args["allow_fascist_fascist_conflict"].convert()?;
     let allow_aggressive_hitler : bool = args["allow_aggressive_hitler"].convert()?;
 
@@ -129,8 +135,7 @@ pub(super) fn filtered_histogramm(
 
     Ok(filtered_assignments
         .into_iter()
-        .flat_map(|ra| ra.iter())
-        .map(|(pid, role)| (*pid, *role))
+        .flat_map(|ra| ra.into_iter())
         .sorted_by_key(|(pid, _role)| *pid)
         .group_by(|(pid, _role)| *pid)
         .into_iter()

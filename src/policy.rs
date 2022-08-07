@@ -1,8 +1,11 @@
 use std::{fmt, str};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::Error;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub(crate) enum Policy {
     Liberal,
     Fascist

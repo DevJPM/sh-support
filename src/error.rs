@@ -1,7 +1,12 @@
 use image::ImageError;
 
-use crate::PlayerID;
+use crate::{
+    players::{PlayerInfos, PlayerManager},
+    PlayerID
+};
 use std::{fmt, io, str};
+
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -9,10 +14,10 @@ pub(crate) enum Error {
     UnexpectedStdout(Vec<u8>),
     UnexpectedStderr(Vec<u8>),
     ImageError(ImageError),
-    EncodingError,
+    EncodingFailed,
     ClipBoardError(arboard::Error),
     BadPlayerID(PlayerID),
-    DeadPlayerID(PlayerID),
+    DeadPlayerID(PlayerID, PlayerInfos),
     ParsePolicyError(String),
     ParseRoleError(String),
     ParseNameError(String),
@@ -21,7 +26,11 @@ pub(crate) enum Error {
     TooShortPatternError { have : usize, requested : usize },
     ReplError(repl_rs::Error),
     LogicalInconsistency,
-    BadFactIndex(usize) //ImpossibleConflict
+    BadPlayerCount(usize),
+    BadFactIndex(usize),
+    NotEligibleChancellor(usize, PlayerInfos),
+    NotEligiblePresident(usize, PlayerInfos),
+    BadJsonConversion(serde_json::Error)
 }
 
 impl From<repl_rs::Error> for Error {
@@ -44,8 +53,12 @@ impl From<arboard::Error> for Error {
     fn from(e : arboard::Error) -> Self { Error::ClipBoardError(e) }
 }
 
+impl From<serde_json::Error> for Error {
+    fn from(e : serde_json::Error) -> Self { Error::BadJsonConversion(e) }
+}
+
 impl fmt::Display for Error {
-    fn fmt(&self, f : &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, f : &mut fmt::Formatter) -> std::result::Result<(), fmt::Error> {
         match self {
             Error::TooLongPatternError { have, requested } => write!(
                 f,
@@ -64,7 +77,9 @@ impl fmt::Display for Error {
                 write!(f, "Failed to parse role name name, found {found} instead.")
             },
             Error::ReplError(error) => write!(f, "{error}"),
-            Error::BadPlayerID(id) => write!(f, "Failed to recognize player {id}."),
+            Error::BadPlayerID(id) => {
+                write!(f, "Failed to recognize the numeric player-id #{id}.")
+            },
             Error::FileSystemError(fserror) => write!(f, "Filesystem error: {fserror}"),
             Error::LogicalInconsistency => write!(
                 f,
@@ -90,11 +105,31 @@ impl fmt::Display for Error {
             ),
             Error::ImageError(e) => write!(f, "{e}"),
             Error::ClipBoardError(e) => write!(f, "{e}"),
-            Error::EncodingError => write!(
+            Error::EncodingFailed => write!(
                 f,
                 "Failed to encode the output png image into the format for the clipboard."
             ),
-            Error::DeadPlayerID(killed) => write!(f,"Player {killed} cannot be selected here because they are dead."),
+            Error::DeadPlayerID(killed, pi) => write!(
+                f,
+                "Player {} cannot be selected here because they are dead.",
+                pi.format_name(*killed)
+            ),
+            Error::BadPlayerCount(input) => write!(
+                f,
+                "A game setup with {input} players was requested, but the standard configurations \
+                 are only specified for 5 to 10 players."
+            ),
+            Error::NotEligibleChancellor(suggestion, pi) => write!(
+                f,
+                "Player {} is not eligible to be elected as chancellor.",
+                pi.format_name(*suggestion)
+            ),
+            Error::NotEligiblePresident(suggestion, pi) => write!(
+                f,
+                "Player {} cannot possibly have become president.",
+                pi.format_name(*suggestion)
+            ),
+            Error::BadJsonConversion(error) => write!(f, "{error}")
         }
     }
 }

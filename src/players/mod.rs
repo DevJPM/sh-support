@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fmt, fs,
+    fmt::{self},
+    fs,
     ops::Deref,
     process::{Command, Stdio},
     rc::Rc
@@ -11,83 +12,91 @@ use contracts::debug_invariant;
 use image::EncodableLayout;
 use itertools::Itertools;
 use repl_rs::{Convert, Value};
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    deck::parse_pattern, error::Error, information::Information, policy::Policy,
-    secret_role::SecretRole, Context, PlayerID
+    deck::{complex_card_counter, next_blues_count, parse_pattern, DeckAnalysis},
+    error::{Error, Result},
+    information::Information,
+    policy::Policy,
+    secret_role::SecretRole,
+    Context, PlayerID
 };
 
 mod filter_engine;
 use filter_engine::*;
+mod callback_vector;
+use callback_vector::*;
+pub mod game_configuration;
+use game_configuration::*;
 
-type Callback = Rc<dyn Fn(&PlayerState, bool) -> Result<(), Error>>;
-
-struct CallBackVec<T> {
-    data : Vec<T>,
-    callback : Callback
+/// CardContext always describes the situation before
+/// the associated (set of) card(s) was drawn
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+pub(crate) struct CardContext {
+    cards_left : usize,
+    cards_discarded : usize,
+    shuffle_index : usize
 }
 
-impl<T> Deref for CallBackVec<T> {
-    type Target = Vec<T>;
-
-    fn deref(&self) -> &Self::Target { &self.data }
-}
-
-impl<T> Default for CallBackVec<T> {
-    fn default() -> Self {
-        Self {
-            data : Default::default(),
-            callback : Rc::new(|_, _| Ok(()))
+impl CardContext {
+    fn atomic_draw(&self, draw_count : usize, discard_count : usize) -> Self {
+        let mut out = *self;
+        if self.cards_left.saturating_sub(draw_count) < 3 {
+            out.cards_left += out.cards_discarded;
+            out.cards_discarded = 0;
+            out.shuffle_index += 1;
         }
+        else {
+            out.cards_discarded += discard_count;
+            out.cards_left -= draw_count;
+        }
+        out
     }
 }
 
-impl<T : fmt::Debug> fmt::Debug for CallBackVec<T> {
-    fn fmt(&self, f : &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CallBackVec")
-            .field("data", &self.data)
-            .finish()
-    }
+pub(crate) type PlayerInfos = BTreeMap<PlayerID, PlayerInfo>;
+
+pub(crate) trait PlayerManager<K> {
+    fn format_name(&self, key : K) -> String;
+
+    fn player_exists(&self, key : K) -> Result<()>;
 }
 
-impl<T> CallBackVec<T> {
-    #[must_use]
-    fn push(&mut self, item : T) -> Callback {
-        self.data.push(item);
-        Rc::clone(&self.callback)
-    }
-
-    #[must_use]
-    fn pop(&mut self) -> Option<Callback> { self.data.pop().map(|_| Rc::clone(&self.callback)) }
-
-    #[must_use]
-    fn remove(&mut self, index : usize) -> Callback {
-        self.data.remove(index);
-        Rc::clone(&self.callback)
-    }
-}
-
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(crate) struct PlayerState {
-    table_size : usize,
-    num_regular_fascists : usize,
+    table_configuration : GameConfiguration,
     available_information : CallBackVec<Information>,
-    current_roles : Vec<BTreeMap<PlayerID, SecretRole>>,
-    player_info : BTreeMap<PlayerID, PlayerInfo>,
-    governments : CallBackVec<Government>
+    player_info : PlayerInfos,
+    governments : CallBackVec<ElectionResult>
 }
 
 impl PlayerState {
+    pub(crate) fn current_roles(&self) -> Vec<BTreeMap<PlayerID, SecretRole>> {
+        self.table_configuration.generate_assignments()
+    }
+
+    pub(crate) fn new(table_configuration : GameConfiguration) -> Self {
+        let player_info = table_configuration.generate_default_info();
+        Self {
+            table_configuration,
+            available_information : Default::default(),
+            player_info,
+            governments : Default::default()
+        }
+    }
+
     pub(crate) fn invariant(&self) -> bool {
-        self.num_regular_fascists <= self.table_size
-            && self.player_info.len() == self.table_size
-            && self.current_roles.iter().all(|ra| {
-                ra.len() == self.table_size
+        self.table_configuration.invariant()
+            && self.player_info.len() == self.table_configuration.table_size
+            && self.current_roles() == self.table_configuration.generate_assignments()
+            && self.current_roles().iter().all(|ra| {
+                ra.len() == self.table_configuration.table_size
                     && ra
                         .iter()
                         .filter(|(_pid, role)| **role == SecretRole::RegularFascist)
                         .count()
-                        == self.num_regular_fascists
+                        == self.table_configuration.num_regular_fascists
                     && ra
                         .iter()
                         .filter(|(_pid, role)| **role == SecretRole::Hitler)
@@ -97,15 +106,328 @@ impl PlayerState {
                         == self.player_info.iter().map(|(pid, _)| pid).collect_vec()
                     && valid_role_assignments(ra, &self.available_information, true, true).is_ok()
             })
-            && self.current_roles.iter().all_unique()
+            && self.current_roles().iter().all_unique()
             && self.player_info.iter().all(|(pid, pi)| pid == &pi.seat)
+    }
+
+    fn player_interactable(&self, player_id : PlayerID, player_info : &PlayerInfos) -> Result<()> {
+        self.player_info.player_exists(player_id)?;
+        validate_non_dead(player_id, &self.governments, player_info)?;
+
+        Ok(())
+    }
+
+    fn count_policies_on_board(&self, policy : Policy) -> usize {
+        self.governments
+            .iter()
+            .filter(|er| er.passed_policy() == policy)
+            .count()
+            + match policy {
+                Policy::Liberal => self.table_configuration.initial_placed_liberal_policies,
+                Policy::Fascist => self.table_configuration.initial_placed_fascist_policies
+            }
+    }
+
+    fn is_eligible_chancellor(&self, player : PlayerID) -> bool {
+        let players_alive = self.table_configuration.table_size
+            - iter_elected(&self.governments)
+                .filter(|g| matches!(g.presidential_action, Kill(_)))
+                .count();
+        match self.governments.last() {
+            None => true,
+            Some(TopDeck(_, _)) => true,
+            Some(Election(gov)) => {
+                gov.chancellor != player && (gov.president != player || players_alive <= 5)
+            },
+        }
+    }
+
+    fn is_eligible_president(&self, player : PlayerID) -> bool {
+        let table_size = self.table_configuration.table_size;
+        // we also can't "just" inspect the last government because people may have died
+        // use an iota vector and a "cursor" to track the state and deaths, as well as
+        // an option for special elections
+        let mut current_president = 0;
+        let mut next_president = 1; // needed for special elections
+        let mut follow_on_president = 2;
+        let mut dead_players = BTreeSet::new();
+
+        let advance_mod_one = |next_president : &mut usize, follow_on_president : &mut usize| {
+            *next_president = *follow_on_president;
+            *follow_on_president += 1;
+            if *follow_on_president > table_size {
+                *follow_on_president = 1;
+            }
+        };
+
+        let advance_one = |current_president : &mut usize,
+                           next_president : &mut usize,
+                           dead_players : &BTreeSet<usize>,
+                           follow_on_president : &mut usize| {
+            *current_president = *next_president;
+            advance_mod_one(next_president, follow_on_president);
+            while dead_players.contains(next_president) {
+                advance_mod_one(next_president, follow_on_president);
+            }
+        };
+
+        for er in self.governments.iter() {
+            match er {
+                TopDeck(_, _) => {
+                    for _ in 0..3 {
+                        advance_one(
+                            &mut current_president,
+                            &mut next_president,
+                            &dead_players,
+                            &mut follow_on_president
+                        );
+                    }
+                },
+                Election(gov) => {
+                    while gov.president != current_president {
+                        advance_one(
+                            &mut current_president,
+                            &mut next_president,
+                            &dead_players,
+                            &mut follow_on_president
+                        );
+                    }
+                    match gov.presidential_action {
+                        Kill(p) => {
+                            dead_players.insert(p);
+                        },
+                        SpecialElection(np) => {
+                            follow_on_president = next_president;
+                            next_president = np;
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        for _ in 0..3 {
+            advance_one(
+                &mut current_president,
+                &mut next_president,
+                &dead_players,
+                &mut follow_on_president
+            );
+
+            if current_president == player {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn collect_information(&self) -> Vec<Information> {
+        let peek_conflicts = iter_elected(&self.governments).tuple_windows().filter_map(
+            |(first, second)| match first.presidential_action {
+                TopDeckPeek(claim) => (second.president_claimed_blues
+                    != claim.iter().filter(|x| x == &&Policy::Liberal).count())
+                .then_some(Information::PolicyConflict(
+                    first.president,
+                    second.president
+                )),
+                PeekAndBurn(claim, false, _) => matches!(
+                    (second.president_claimed_blues, claim),
+                    (0, Policy::Liberal) | (3, Policy::Fascist)
+                )
+                .then_some(Information::PolicyConflict(
+                    first.president,
+                    second.president
+                )),
+                _ => None
+            }
+        );
+
+        let immediate_conflicts = iter_elected(&self.governments).flat_map(|gov| {
+            [
+                gov.chancellor_confirmed_not_hitler
+                    .then_some(Information::ConfirmedNotHitler(gov.chancellor)),
+                gov.conflict
+                    .then_some(Information::PolicyConflict(gov.president, gov.chancellor)),
+                match gov.presidential_action {
+                    NoAction => None,
+                    Kill(dead_player) => Some(Information::ConfirmedNotHitler(dead_player)),
+                    Investigation(investigatee, Policy::Fascist) => {
+                        Some(Information::FascistInvestigation {
+                            investigator : gov.president,
+                            investigatee
+                        })
+                    },
+                    Investigation(investigatee, Policy::Liberal) => {
+                        Some(Information::LiberalInvestigation {
+                            investigator : gov.president,
+                            investigatee
+                        })
+                    },
+                    RevealParty(investigator, Policy::Fascist) => {
+                        Some(Information::FascistInvestigation {
+                            investigator,
+                            investigatee : gov.president
+                        })
+                    },
+                    RevealParty(investigator, Policy::Liberal) => {
+                        Some(Information::LiberalInvestigation {
+                            investigator,
+                            investigatee : gov.president
+                        })
+                    },
+                    // peeks are handled by windowed pre-processing
+                    _ => None
+                }
+            ]
+            .into_iter()
+            .flatten()
+        });
+
+        let shuffles = self.shuffle_election_results();
+
+        let card_count_deductions = shuffles.iter().filter_map(|sa| {
+            let seen_blues = sa.total_seen_blues();
+            let governments = sa.election_results.iter().filter_map(|er| match er {
+                TopDeck(_, _) => None,
+                Election(eg) => Some(eg)
+            });
+            if seen_blues + sa.total_leftover < sa.initial_deck_liberal {
+                Some(Information::AtLeastOneFascist(
+                    governments
+                        .filter_map(|eg| (eg.president_claimed_blues < 3).then_some(eg.president))
+                        .collect()
+                ))
+            }
+            else if seen_blues > sa.initial_deck_liberal {
+                Some(Information::AtLeastOneFascist(
+                    governments
+                        .filter_map(|eg| (eg.president_claimed_blues > 0).then_some(eg.president))
+                        .collect()
+                ))
+            }
+            else {
+                None
+            }
+        });
+
+        immediate_conflicts
+            .chain(peek_conflicts)
+            .chain(card_count_deductions)
+            .chain(self.available_information.iter().cloned())
+            .collect()
+    }
+
+    fn shuffle_election_results(&self) -> Vec<ShuffleAnalysis<'_>> {
+        let total_lib_cards = self.table_configuration.initial_placed_liberal_policies
+            + self.table_configuration.initial_liberal_deck_policies;
+        let total_fasc_cards = self.table_configuration.initial_placed_fascist_policies
+            + self.table_configuration.initial_fascist_deck_policies;
+        let total_cards = total_lib_cards + total_fasc_cards;
+
+        self.governments
+            .iter()
+            .group_by(|er| match er {
+                TopDeck(_, cc) => cc.shuffle_index,
+                Election(gov) => gov.deck_context.shuffle_index
+            })
+            .into_iter()
+            .scan(
+                (
+                    self.table_configuration.initial_placed_fascist_policies,
+                    self.table_configuration.initial_placed_liberal_policies
+                ),
+                |(fpc, lpc), (idx, ver)| {
+                    let election_results = ver.collect_vec();
+                    let (total_drawn, total_discarded) = election_results
+                        .iter()
+                        .map(|er| er.cards_total_drawn_discarded())
+                        .fold((0, 0), |(acc_l, acc_r), (cl, cr)| (acc_l + cl, acc_r + cr));
+                    let (lfpc, llpc) = (*fpc, *lpc);
+                    let blues_passed = election_results
+                        .iter()
+                        .filter(|er| er.passed_policy() == Policy::Liberal)
+                        .count();
+                    let reds_passed = election_results.len() - blues_passed;
+                    *fpc += reds_passed;
+                    *lpc += blues_passed;
+                    Some(ShuffleAnalysis {
+                        shuffle_index : idx,
+                        election_results,
+                        initial_deck_fascist : total_fasc_cards - lfpc,
+                        initial_deck_liberal : total_lib_cards - llpc,
+                        total_discarded,
+                        total_leftover : total_cards - (lfpc + llpc) - total_drawn
+                    })
+                }
+            )
+            .collect()
+    }
+
+    fn build_next_card_context(&self) -> CardContext {
+        if let Some(latest) = self.governments.last() {
+            match latest {
+                TopDeck(_, ctxt) => ctxt.atomic_draw(1, 0),
+                Election(gov) => match gov.presidential_action {
+                    PeekAndBurn(_, true, ctxt) => ctxt.atomic_draw(1, 1),
+                    _ => gov.deck_context.atomic_draw(3, 2)
+                }
+            }
+        }
+        else {
+            CardContext {
+                cards_left : self.table_configuration.initial_fascist_deck_policies
+                    + self.table_configuration.initial_liberal_deck_policies,
+                cards_discarded : 0,
+                shuffle_index : 0
+            }
+        }
+    }
+}
+
+struct ShuffleAnalysis<'a> {
+    shuffle_index : usize,
+    election_results : Vec<&'a ElectionResult>,
+    initial_deck_fascist : usize,
+    initial_deck_liberal : usize,
+    total_discarded : usize,
+    total_leftover : usize
+}
+
+impl ShuffleAnalysis<'_> {
+    fn total_seen_blues(&self) -> usize {
+        self.election_results.iter().map(|er| er.seen_blues()).sum()
+    }
+}
+
+fn iter_elected(govs : &[ElectionResult]) -> impl Iterator<Item = &ElectedGovernment> {
+    govs.iter().filter_map(|er| match er {
+        TopDeck(_, _) => None,
+        Election(gov) => Some(gov)
+    })
+}
+
+impl PlayerManager<PlayerID> for PlayerInfos {
+    fn format_name(&self, key : PlayerID) -> String {
+        self.get(&key)
+            .map(|p| format!("{p}"))
+            .unwrap_or(format!("{key}"))
+    }
+
+    fn player_exists(&self, key : PlayerID) -> Result<()> {
+        if !self.contains_key(&key) {
+            Err(Error::BadPlayerID(key))
+        }
+        else {
+            Ok(())
+        }
     }
 }
 
 fn parse_player_name(
     input : &str,
     registered_names : &BTreeMap<PlayerID, PlayerInfo>
-) -> Result<PlayerID, Error> {
+) -> Result<PlayerID> {
     if let Ok(numerical_indicator) = input.parse::<PlayerID>() {
         return Ok(numerical_indicator);
     }
@@ -159,32 +481,178 @@ fn parse_player_name(
 
 fn validate_non_dead(
     killed_player : usize,
-    governments : &CallBackVec<Government>
-) -> Result<(), Error> {
+    governments : &CallBackVec<ElectionResult>,
+    player_info : &PlayerInfos
+) -> Result<()> {
     if governments
         .iter()
-        .any(|g| matches!(g.killed_player, Some(d) if d==killed_player))
+        .any(|g| matches!(g, Election(g) if matches!(g.presidential_action, Kill(d) if d==killed_player )))
     {
-        Err(Error::DeadPlayerID(killed_player))
+        Err(Error::DeadPlayerID(killed_player,player_info.clone()))
     }
     else {
         Ok(())
     }
 }
 
-#[derive(Debug, Clone)]
-struct Government {
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, PartialEq, Eq)]
+#[serde(tag = "type", content = "content")]
+pub(crate) enum PresidentialAction {
+    NoAction,
+    Kill(PlayerID),
+    Investigation(PlayerID, Policy),
+    RevealParty(PlayerID, Policy),
+    TopDeckPeek([Policy; 3]),
+    SpecialElection(PlayerID),
+    /// true means discarded
+    PeekAndBurn(Policy, bool, CardContext)
+}
+
+use PresidentialAction::*;
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) enum ElectionResult {
+    TopDeck(Policy, CardContext),
+    Election(ElectedGovernment)
+}
+
+impl ElectionResult {
+    pub(crate) fn cards_total_drawn_discarded(&self) -> (usize, usize) {
+        match self {
+            TopDeck(_, _) => (1, 0),
+            Election(gov) => match gov.presidential_action {
+                PeekAndBurn(_, true, _) => (4, 3),
+                _ => (3, 2)
+            }
+        }
+    }
+
+    pub(crate) fn passed_policy(&self) -> Policy {
+        match self {
+            TopDeck(p, _) => *p,
+            Election(gov) => gov.policy_passed
+        }
+    }
+
+    pub(crate) fn seen_blues(&self) -> usize {
+        match self {
+            TopDeck(Policy::Liberal, _) => 1,
+            Election(gov) => {
+                gov.president_claimed_blues
+                    + match gov.presidential_action {
+                        PeekAndBurn(Policy::Liberal, true, _) => 1,
+                        _ => 0
+                    }
+            },
+            _ => 0
+        }
+    }
+
+    pub(crate) fn passed_blues(&self) -> usize {
+        if self.passed_policy() == Policy::Liberal {
+            1
+        }
+        else {
+            0
+        }
+    }
+}
+
+pub(crate) trait PlayerFormatable {
+    fn format(&self, player_info : &PlayerInfos) -> String;
+}
+
+impl PlayerFormatable for ElectionResult {
+    fn format(&self, player_info : &PlayerInfos) -> String {
+        match self {
+            TopDeck(card, _) => {
+                format!("Enough elections failed resulting in a top deck of a {card} policy.")
+            },
+            Election(gov) => gov.format(player_info)
+        }
+    }
+}
+
+use ElectionResult::*;
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) struct ElectedGovernment {
     president : PlayerID,
     chancellor : PlayerID,
-    president_claimed_blues : usize,
+    pub president_claimed_blues : usize,
     chancellor_claimed_blues : usize,
     conflict : bool,
     policy_passed : Policy,
-    killed_player : Option<PlayerID>
+    presidential_action : PresidentialAction,
+    deck_context : CardContext,
+    chancellor_confirmed_not_hitler : bool /* first president then chancellor votes
+                                            * true = veto'ed
+                                            *veto_result : Option<(bool, bool)> */
+}
+
+impl PlayerFormatable for ElectedGovernment {
+    fn format(&self, player_info : &PlayerInfos) -> String {
+        let presidential_action = match self.presidential_action {
+            NoAction => "".to_string(),
+            Kill(dead) => format!(
+                "The president also decided to kill {}.",
+                player_info.format_name(dead)
+            ),
+            Investigation(investigatee, result) => format!(
+                "The president also investigated {} and claims to have found a {} party member.",
+                player_info.format_name(investigatee),
+                result
+            ),
+            RevealParty(investigator, result) => format!(
+                "The president also showed their party membership to {} who claims to have seen \
+                 {} party membership.",
+                player_info.format_name(investigator),
+                result
+            ),
+            TopDeckPeek(peek) => format!(
+                "The president also looked at the top three cards of the deck and claims to have \
+                 seen {}.",
+                peek.iter().map(|s| format!("{s}")).join("")
+            ),
+            SpecialElection(electee) => format!(
+                "The president also decided to appoint {} as the next president.",
+                player_info.format_name(electee)
+            ),
+            PeekAndBurn(result, true, _) => format!(
+                "The president also peeked at the top card of the deck and decided to discard the \
+                 {result} policy."
+            ),
+            PeekAndBurn(result, false, _) => format!(
+                "The president also looked at the top card of the deck and claims to have found a \
+                 {result} policy without discarding it."
+            )
+        };
+        format!(
+            "President {} (claim: {}) and chancellor {} (claim: {}{}) passed a {} policy{} {}",
+            player_info.format_name(self.president),
+            generate_claim_pattern_from_blues(self.president_claimed_blues, 3),
+            player_info.format_name(self.chancellor),
+            generate_claim_pattern_from_blues(self.chancellor_claimed_blues, 2),
+            if self.chancellor_confirmed_not_hitler {
+                "; confirmed not Hitler now"
+            }
+            else {
+                ""
+            },
+            self.policy_passed,
+            if self.conflict {
+                " which resulted in a conflict."
+            }
+            else {
+                "."
+            },
+            presidential_action
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
-struct PlayerInfo {
+pub(crate) struct PlayerInfo {
     seat : PlayerID,
     name : String
 }
@@ -201,73 +669,26 @@ impl fmt::Display for PlayerInfo {
 }
 
 #[debug_invariant(context.invariant())]
-pub(crate) fn roles(
+pub(crate) fn standard_game(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
-    *player_state = PlayerState::default();
 
-    let num_lib : usize = args["num_lib"].convert()?;
-    let num_fasc : usize = args["num_fasc"].convert()?;
+    let table_size : usize = args["player_count"].convert()?;
+    let rebalanced : bool = args["rebalance"].convert()?;
 
-    let table_size = num_fasc + num_lib + 1;
-    player_state.table_size = table_size;
-    player_state.num_regular_fascists = num_fasc;
-    player_state.player_info = (1..=table_size)
-        .into_iter()
-        .map(|pid| {
-            (
-                pid,
-                PlayerInfo {
-                    seat : pid,
-                    name : String::new()
-                }
-            )
-        })
-        .collect();
+    *player_state = PlayerState::new(GameConfiguration::new_standard(table_size, rebalanced)?);
 
-    player_state.current_roles = (0..num_fasc + num_lib)
-        .into_iter()
-        .combinations(num_fasc)
-        .flat_map(move |fasc_pos| {
-            (0..table_size).into_iter().map(move |hitler_pos| {
-                (
-                    hitler_pos,
-                    fasc_pos
-                        .iter()
-                        .map(|fp| {
-                            if *fp >= hitler_pos {
-                                fp + 1
-                            }
-                            else {
-                                *fp
-                            }
-                        })
-                        .collect_vec()
-                )
-            })
-        })
-        .map(|(hitler_pos, fascist_pos)| {
-            let mut out = vec![SecretRole::Liberal; table_size];
-            out[hitler_pos] = SecretRole::Hitler;
-            fascist_pos
-                .iter()
-                .for_each(|i| out[*i] = SecretRole::RegularFascist);
-            out.into_iter()
-                .enumerate()
-                .map(|(pos, role)| (pos + 1, role))
-                .collect::<BTreeMap<_, _>>()
-        })
-        .collect_vec();
+    let num_reg_fasc = player_state.table_configuration.num_regular_fascists;
 
     Ok(Some(format!(
         "Successfully generated {} role-assignments ({}-player seat assignments) with {} liberal \
          and {} regular fascist roles each.",
-        player_state.current_roles.len(),
+        player_state.current_roles().len(),
         table_size,
-        num_lib,
-        num_fasc
+        table_size - 1 - num_reg_fasc,
+        num_reg_fasc
     )))
 }
 
@@ -275,11 +696,11 @@ pub(crate) fn roles(
 pub(crate) fn debug_roles(
     _args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     Ok(Some(
         context
             .player_state
-            .current_roles
+            .current_roles()
             .iter()
             .map(|vpol| {
                 vpol.iter()
@@ -294,14 +715,66 @@ pub(crate) fn debug_roles(
 pub(crate) fn show_facts(
     _args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
-    Ok(Some(
+) -> Result<Option<String>> {
+    Ok(Some(format!(
+        "Manually added facts with their removal index:\n{}",
         context
             .player_state
             .available_information
             .iter()
             .enumerate()
-            .map(|(index, information)| format!("{}. {}", index + 1, information))
+            .map(|(index, information)| {
+                format!(
+                    "{}. {}",
+                    index + 1,
+                    information.format(&context.player_state.player_info)
+                )
+            })
+            .join("\n")
+    )))
+}
+
+#[debug_invariant(context.invariant())]
+pub(crate) fn show_known_facts(
+    _args : HashMap<String, Value>,
+    context : &mut Context
+) -> Result<Option<String>> {
+    Ok(Some(format!(
+        "Manually added and deduced information:\n{}",
+        context
+            .player_state
+            .collect_information()
+            .iter()
+            .enumerate()
+            .map(|(index, information)| {
+                format!(
+                    "{}. {}",
+                    index + 1,
+                    information.format(&context.player_state.player_info)
+                )
+            })
+            .join("\n")
+    )))
+}
+
+#[debug_invariant(context.invariant())]
+pub(crate) fn show_governments(
+    _args : HashMap<String, Value>,
+    context : &mut Context
+) -> Result<Option<String>> {
+    Ok(Some(
+        context
+            .player_state
+            .governments
+            .iter()
+            .enumerate()
+            .map(|(index, er)| {
+                format!(
+                    "{}. {}",
+                    index + 1,
+                    er.format(&context.player_state.player_info)
+                )
+            })
             .join("\n")
     ))
 }
@@ -310,16 +783,14 @@ pub(crate) fn show_facts(
 pub(crate) fn add_hard_fact(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
     let factual_position : String = args["player_position"].convert()?;
     let factual_position = parse_player_name(&factual_position, &player_state.player_info)?;
     let factual_role : String = args["role"].convert()?;
     let factual_role : SecretRole = factual_role.parse()?;
 
-    if !player_state.player_info.contains_key(&factual_position) {
-        return Err(Error::BadPlayerID(factual_position));
-    }
+    player_state.player_info.player_exists(factual_position)?;
 
     player_state
         .available_information
@@ -327,7 +798,7 @@ pub(crate) fn add_hard_fact(
 
     Ok(Some(format!(
         "Successfully added the information that player {} is {} to the fact database.",
-        format_name(factual_position, &player_state.player_info),
+        player_state.player_info.format_name(factual_position),
         factual_role
     )))
 }
@@ -336,20 +807,15 @@ pub(crate) fn add_hard_fact(
 pub(crate) fn add_conflict(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
     let president : String = args["president"].convert()?;
     let president = parse_player_name(&president, &player_state.player_info)?;
     let chancellor : String = args["chancellor"].convert()?;
     let chancellor = parse_player_name(&chancellor, &player_state.player_info)?;
 
-    if !player_state.player_info.contains_key(&president) {
-        return Err(Error::BadPlayerID(president));
-    }
-
-    if !player_state.player_info.contains_key(&chancellor) {
-        return Err(Error::BadPlayerID(chancellor));
-    }
+    player_state.player_info.player_exists(president)?;
+    player_state.player_info.player_exists(president)?;
 
     player_state
         .available_information
@@ -357,8 +823,8 @@ pub(crate) fn add_conflict(
 
     Ok(Some(format!(
         "Successfully added the conflict between {} and {} to the fact database.",
-        format_name(president, &player_state.player_info),
-        format_name(chancellor, &player_state.player_info)
+        player_state.player_info.format_name(president),
+        player_state.player_info.format_name(chancellor)
     )))
 }
 
@@ -366,20 +832,15 @@ pub(crate) fn add_conflict(
 pub(crate) fn liberal_investigation(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
     let investigator : String = args["investigator"].convert()?;
     let investigator = parse_player_name(&investigator, &player_state.player_info)?;
     let investigatee : String = args["investigatee"].convert()?;
     let investigatee = parse_player_name(&investigatee, &player_state.player_info)?;
 
-    if !player_state.player_info.contains_key(&investigator) {
-        return Err(Error::BadPlayerID(investigator));
-    }
-
-    if !player_state.player_info.contains_key(&investigatee) {
-        return Err(Error::BadPlayerID(investigatee));
-    }
+    player_state.player_info.player_exists(investigator)?;
+    player_state.player_info.player_exists(investigatee)?;
 
     player_state
         .available_information
@@ -390,8 +851,8 @@ pub(crate) fn liberal_investigation(
 
     Ok(Some(format!(
         "Successfully added the liberal investigation of {} on {} to the fact database.",
-        format_name(investigator, &player_state.player_info),
-        format_name(investigatee, &player_state.player_info)
+        player_state.player_info.format_name(investigator),
+        player_state.player_info.format_name(investigatee)
     )))
 }
 
@@ -399,20 +860,15 @@ pub(crate) fn liberal_investigation(
 pub(crate) fn fascist_investigation(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
     let investigator : String = args["investigator"].convert()?;
     let investigator = parse_player_name(&investigator, &player_state.player_info)?;
     let investigatee : String = args["investigatee"].convert()?;
     let investigatee = parse_player_name(&investigatee, &player_state.player_info)?;
 
-    if !player_state.player_info.contains_key(&investigator) {
-        return Err(Error::BadPlayerID(investigator));
-    }
-
-    if !player_state.player_info.contains_key(&investigatee) {
-        return Err(Error::BadPlayerID(investigatee));
-    }
+    player_state.player_info.player_exists(investigator)?;
+    player_state.player_info.player_exists(investigatee)?;
 
     player_state
         .available_information
@@ -423,8 +879,8 @@ pub(crate) fn fascist_investigation(
 
     Ok(Some(format!(
         "Successfully added the fascist investigation of {} on {} to the fact database.",
-        format_name(investigator, &player_state.player_info),
-        format_name(investigatee, &player_state.player_info)
+        player_state.player_info.format_name(investigator),
+        player_state.player_info.format_name(investigatee)
     )))
 }
 
@@ -432,14 +888,12 @@ pub(crate) fn fascist_investigation(
 pub(crate) fn confirm_not_hitler(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
     let player : String = args["player"].convert()?;
     let player = parse_player_name(&player, &player_state.player_info)?;
 
-    if !player_state.player_info.contains_key(&player) {
-        return Err(Error::BadPlayerID(player));
-    }
+    player_state.player_info.player_exists(player)?;
 
     player_state
         .available_information
@@ -447,7 +901,7 @@ pub(crate) fn confirm_not_hitler(
 
     Ok(Some(format!(
         "Successfully added the confirmation that player {} is not Hitler to the database.",
-        format_name(player, &player_state.player_info)
+        player_state.player_info.format_name(player)
     )))
 }
 
@@ -455,7 +909,7 @@ pub(crate) fn confirm_not_hitler(
 pub(crate) fn remove_fact(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let factual_position : usize = args["fact_to_be_removed"].convert()?;
 
     if factual_position > context.player_state.available_information.len() || factual_position == 0
@@ -466,7 +920,8 @@ pub(crate) fn remove_fact(
     context
         .player_state
         .available_information
-        .remove(factual_position - 1)(&context.player_state, true)?;
+        .remove(factual_position - 1)
+        .ok_or(Error::BadFactIndex(factual_position))?(&context.player_state, true)?;
 
     Ok(Some(format!(
         "Successfully removed the fact #{factual_position} from the database."
@@ -477,7 +932,7 @@ pub(crate) fn remove_fact(
 pub(crate) fn debug_filtered_roles(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
     let filtered_assignments = filter_assigned_roles(args, player_state)?;
 
@@ -487,11 +942,7 @@ pub(crate) fn debug_filtered_roles(
             .map(|vpol| {
                 vpol.iter()
                     .map(|(pos, role)| {
-                        format!(
-                            "({}: {})",
-                            format_name(*pos, &player_state.player_info),
-                            role
-                        )
+                        format!("({}: {})", player_state.player_info.format_name(*pos), role)
                     })
                     .join(", ")
             })
@@ -503,9 +954,9 @@ pub(crate) fn debug_filtered_roles(
 pub(crate) fn impossible_teams(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let player_state = &mut context.player_state;
-    let num_fascists = player_state.num_regular_fascists + 1;
+    let num_fascists = player_state.table_configuration.num_regular_fascists + 1;
 
     let filtered_assignments = filter_assigned_roles(args, player_state)?;
 
@@ -522,7 +973,7 @@ pub(crate) fn impossible_teams(
     let mut impossible_teams = vec![];
 
     for impossible_size in 1..=num_fascists {
-        let mut local_impossible = (1..=player_state.table_size)
+        let mut local_impossible = (1..=player_state.table_configuration.table_size)
             .combinations(impossible_size)
             .map(|faspos| faspos.into_iter().collect::<BTreeSet<_>>())
             .filter(|faspos| {
@@ -546,7 +997,7 @@ pub(crate) fn impossible_teams(
                 (
                     vfas.len(),
                     vfas.into_iter()
-                        .map(|fpos| format_name(fpos, &player_state.player_info))
+                        .map(|fpos| player_state.player_info.format_name(fpos))
                         .join(" and ")
                 )
             })
@@ -566,7 +1017,7 @@ pub(crate) fn impossible_teams(
 pub(crate) fn hitler_snipe(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
     let histogram = filtered_histogramm(args, player_state)?;
 
@@ -588,7 +1039,7 @@ pub(crate) fn hitler_snipe(
                 format!(
                     "{}. Player {}: {:.1}% ({hitler_count}/{total_count}) chance of being Hitler.",
                     index + 1,
-                    format_name(*pid, &player_state.player_info),
+                    player_state.player_info.format_name(*pid),
                     (hitler_count as f64 / total_count as f64) * 100.0
                 )
             })
@@ -600,7 +1051,7 @@ pub(crate) fn hitler_snipe(
 pub(crate) fn liberal_percent(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
     let histogram = filtered_histogramm(args, player_state)?;
 
@@ -620,7 +1071,7 @@ pub(crate) fn liberal_percent(
             .map(|(pid, (lib_count, total_count))| {
                 format!(
                     "Player {}: {:.1}% ({lib_count}/{total_count}) chance of being a liberal.",
-                    format_name(*pid, &player_state.player_info),
+                    player_state.player_info.format_name(*pid),
                     (lib_count as f64 / total_count as f64) * 100.0
                 )
             })
@@ -628,26 +1079,17 @@ pub(crate) fn liberal_percent(
     ))
 }
 
-fn format_name(pid : usize, players : &BTreeMap<PlayerID, PlayerInfo>) -> String {
-    players
-        .get(&pid)
-        .map(|p| format!("{p}"))
-        .unwrap_or(format!("{pid}"))
-}
-
-fn generate_claim_pattern_from_blues(blues : usize) -> String {
-    match blues {
-        0 => "RRR".to_string(),
-        1 => "RRB".to_string(),
-        2 => "RBB".to_string(),
-        3 => "BBB".to_string(),
-        _ => unreachable!()
-    }
+fn generate_claim_pattern_from_blues(blues : usize, pattern_length : usize) -> String {
+    let num_reds = pattern_length - blues;
+    std::iter::repeat("R")
+        .take(num_reds)
+        .chain(std::iter::repeat("B").take(blues))
+        .join("")
 }
 
 fn generate_dot_report(
     information : &Vec<Information>,
-    governments : &[Government],
+    governments : &[ElectionResult],
     players : &BTreeMap<PlayerID, PlayerInfo>
 ) -> String {
     let mut node_attributes : BTreeMap<PlayerID, Vec<Information>> = BTreeMap::new();
@@ -656,46 +1098,57 @@ fn generate_dot_report(
     });
     let mut statements = vec![];
 
-    let display_name = |pid| format_name(pid, players);
+    let display_name = |pid| players.format_name(pid);
 
     let mut handled_conflicts = BTreeSet::new();
 
     for (index, gov) in governments.iter().enumerate() {
-        let mut chancellor_claim = generate_claim_pattern_from_blues(gov.chancellor_claimed_blues);
-        chancellor_claim.remove(0);
-        statements.push(format!(
-            "{}->{} [label={},color={},dir={},taillabel={},headlabel={}]",
-            gov.president,
-            gov.chancellor,
-            index + 1,
-            if gov.policy_passed == Policy::Liberal {
-                "blue"
-            }
-            else {
-                "red"
+        match gov {
+            Election(gov) => {
+                let mut chancellor_claim =
+                    generate_claim_pattern_from_blues(gov.chancellor_claimed_blues, 2);
+                chancellor_claim.remove(0);
+                statements.push(format!(
+                    "{}->{} [label={},color={},dir={},taillabel={},headlabel={}]",
+                    gov.president,
+                    gov.chancellor,
+                    index + 1,
+                    if gov.policy_passed == Policy::Liberal {
+                        "blue"
+                    }
+                    else {
+                        "red"
+                    },
+                    if gov.conflict
+                        || information.iter().any(|info| matches!(
+                            info,
+                            Information::PolicyConflict(l, r) if (*l==gov.president && *r==gov.chancellor) || (*l==gov.chancellor && *r==gov.president)
+                        ))
+                    {
+                        handled_conflicts.insert((gov.president, gov.chancellor));
+                        "both"
+                    }
+                    else {
+                        "none"
+                    },
+                    generate_claim_pattern_from_blues(gov.president_claimed_blues,3),
+                    chancellor_claim
+                ));
+                if let Kill(killed_player) = gov.presidential_action {
+                    statements.push(format!(
+                        "{}->{} [label=killed, arrowhead=open]",
+                        gov.president, killed_player,
+                    ));
+                }
             },
-            if gov.conflict {
-                handled_conflicts.insert((gov.president, gov.chancellor));
-                "both"
-            }
-            else {
-                "none"
-            },
-            generate_claim_pattern_from_blues(gov.president_claimed_blues),
-            chancellor_claim
-        ));
-        if let Some(killed_player) = gov.killed_player {
-            statements.push(format!(
-                "{}->{} [label=killed, arrowhead=open]",
-                gov.president, killed_player,
-            ));
+            TopDeck(_, _) => {}
         }
     }
 
     for info in information {
         match info {
             Information::ConfirmedNotHitler(pid) => {
-                node_attributes.entry(*pid).or_default().push(*info)
+                node_attributes.entry(*pid).or_default().push(info.clone())
             },
             // only add this, if it was a manual conflict (i.e. if the two nodes don't already have
             // a gov-based conflict), e.g. to insert deck-peek based conflicts into the graph
@@ -713,7 +1166,9 @@ fn generate_dot_report(
                 investigator,
                 investigatee
             } => statements.push(format!("{investigator} -> {investigatee} [color=red]")),
-            Information::HardFact(pid, _) => node_attributes.entry(*pid).or_default().push(*info),
+            Information::HardFact(pid, _) => {
+                node_attributes.entry(*pid).or_default().push(info.clone())
+            },
             _ => {}
         }
     }
@@ -754,13 +1209,12 @@ enum InvocationStrategy {
 pub(crate) fn graph(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     //let mut player_state = &mut context.player_state;
     let filename : String = args["filename"].convert()?;
     let resp_filename = filename.clone();
     let auto_update : bool = args["auto"].convert()?;
     let executable : String = args["dot-invocation"].convert()?;
-    let executable_l = executable.to_lowercase();
 
     let dotfile = format!("{filename}.dot");
     let imagefile = format!("{filename}.png");
@@ -772,19 +1226,12 @@ pub(crate) fn graph(
         dotfile.clone(),
     ];
 
-    let strategy = match executable_l.as_str() {
-        "bash" => InvocationStrategy::Bash,
-        "dot" => InvocationStrategy::Directly,
-        "" => InvocationStrategy::None,
-        _ => return Err(Error::BadExecutable(executable))
-    };
+    let (baseline_command, strategy) = executable_parser(executable)?;
 
-    let baseline_command = executable_l;
-
-    context.player_state.available_information.callback = Rc::new(move |ps, auto| {
+    let closure : Callback = Rc::new(move |ps, auto| {
         if !auto || auto_update {
             let file_content = generate_dot_report(
-                ps.available_information.deref(),
+                &ps.collect_information(),
                 ps.governments.deref(),
                 &ps.player_info
             );
@@ -815,7 +1262,7 @@ pub(crate) fn graph(
             }
 
             let image = image::io::Reader::open(&imagefile)?.decode()?;
-            let image = image.as_rgba8().ok_or(Error::EncodingError)?;
+            let image = image.as_rgba8().ok_or(Error::EncodingFailed)?;
             let mut clipboard = Clipboard::new()?;
             clipboard.set_image(ImageData {
                 width : image.width() as usize,
@@ -828,9 +1275,16 @@ pub(crate) fn graph(
 
         Ok(())
     });
-    context.player_state.governments.callback =
-        Rc::clone(&context.player_state.available_information.callback);
-    context.player_state.governments.callback.clone()(&context.player_state, false)?;
+
+    context
+        .player_state
+        .available_information
+        .register_callback(CallbackKind::GovernmentOverviewGraph, Rc::clone(&closure));
+    context
+        .player_state
+        .governments
+        .register_callback(CallbackKind::GovernmentOverviewGraph, Rc::clone(&closure));
+    context.player_state.governments.callback()(&context.player_state, false)?;
 
     Ok(Some(format!(
         "Run \"dot -Tpng -o {resp_filename}.png {resp_filename}.dot\" in a separate shell (e.g. \
@@ -842,7 +1296,7 @@ pub(crate) fn graph(
 pub(crate) fn name(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let position : usize = args["position"].convert()?;
     let name : String = args["display_name"].convert()?;
 
@@ -862,7 +1316,7 @@ pub(crate) fn name(
 pub(crate) fn add_government(
     args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>> {
     let player_state = &mut context.player_state;
     let president : String = args["president"].convert()?;
     let president = parse_player_name(&president, &player_state.player_info)?;
@@ -870,81 +1324,115 @@ pub(crate) fn add_government(
     let chancellor = parse_player_name(&chancellor, &player_state.player_info)?;
     let presidential_pattern : String = args["presidential_blues"].convert()?;
     let chancellor_pattern : String = args["chancellor_blues"].convert()?;
-    let killed_player : String = args["killed_player"].convert()?;
-    let killed_player = if matches!(killed_player.parse::<usize>(), Ok(0)) {
-        None
-    }
-    else {
-        let killed_player = parse_player_name(&killed_player, &player_state.player_info)?;
-        validate_non_dead(killed_player, &player_state.governments)?;
-        Some(killed_player)
-    };
 
-    validate_non_dead(president, &player_state.governments)?;
-    validate_non_dead(chancellor, &player_state.governments)?;
-    //let mut conflict : bool = args["conflict"].convert()?;
+    // TODO: validate that you can actually choose the given government based on
+    // exclusion rules (previous elected people and max allowed number of skips)
+    // also remember to include special elections and kills
+    player_state.player_interactable(president, &player_state.player_info)?;
+    player_state.player_interactable(chancellor, &player_state.player_info)?;
+
+    if !player_state.is_eligible_president(president) {
+        return Err(Error::NotEligiblePresident(
+            president,
+            context.player_state.player_info.clone()
+        ));
+    }
+
+    if !player_state.is_eligible_chancellor(chancellor) || chancellor == president {
+        return Err(Error::NotEligibleChancellor(
+            chancellor,
+            context.player_state.player_info.clone()
+        ));
+    }
 
     let president_claimed_blues = parse_pattern(presidential_pattern, 3, 3)?.0;
     let chancellor_claimed_blues = parse_pattern(chancellor_pattern, 2, 2)?.0;
 
-    let conflict = president_claimed_blues > 0 && chancellor_claimed_blues == 0;
+    let immediate_conflict = president_claimed_blues > 0 && chancellor_claimed_blues == 0;
 
-    if !player_state.player_info.contains_key(&president) {
-        return Err(Error::BadPlayerID(president));
-    }
-    if !player_state.player_info.contains_key(&chancellor) {
-        return Err(Error::BadPlayerID(chancellor));
-    }
-    if let Some(killed_player) = killed_player {
-        if !player_state.player_info.contains_key(&killed_player) {
-            return Err(Error::BadPlayerID(killed_player));
-        }
-    }
+    let retrieve_player_opt_first = || -> Result<_> {
+        let text_input : String = args["first_argument"].convert()?;
+        let extraced_player = parse_player_name(&text_input, &player_state.player_info)?;
+        player_state.player_interactable(extraced_player, &player_state.player_info)?;
+        Ok(extraced_player)
+    };
 
-    player_state.governments.push(Government {
-        president,
-        chancellor,
-        president_claimed_blues,
-        chancellor_claimed_blues,
-        conflict,
-        policy_passed : if (conflict && president_claimed_blues > 0) || president_claimed_blues == 0
-        {
+    let retrieve_policy_opt_second = || -> Result<_> {
+        let text_input : String = args["second_argument"].convert()?;
+        Ok(*parse_pattern(text_input, 1, 1)?.2.first().unwrap())
+    };
+
+    let retrieve_policy_opt_first = |count| -> Result<_> {
+        let text_input : String = args["first_argument"].convert()?;
+        Ok(parse_pattern(text_input, count, count)?.2)
+    };
+
+    let retrieve_boolean_opt_second = || -> Result<_> {
+        let text_input : bool = args["first_argument"].convert()?;
+        Ok(text_input)
+    };
+
+    let policy_passed =
+        if (immediate_conflict && president_claimed_blues > 0) || president_claimed_blues == 0 {
             Policy::Fascist
         }
         else {
             Policy::Liberal
-        },
-        killed_player
-    })(player_state, true)?;
+        };
 
-    if conflict {
-        player_state
-            .available_information
-            .push(Information::PolicyConflict(president, chancellor))(player_state, true)?;
-    }
+    let prev_fas_policies = player_state.count_policies_on_board(Policy::Fascist);
 
-    if let Some(killed_player) = killed_player {
-        player_state
-            .available_information
-            .push(Information::ConfirmedNotHitler(killed_player))(player_state, true)?;
-    }
+    let deck_context = player_state.build_next_card_context();
 
-    let kill = if let Some(killed_player) = killed_player {
-        format!(
-            " President {} also chose to execute {}.",
-            format_name(president, &player_state.player_info),
-            format_name(killed_player, &player_state.player_info)
-        )
+    let presidential_action = if policy_passed == Policy::Fascist {
+        if prev_fas_policies >= 5 {
+            return Ok(Some("gg, fascists won.".to_string()));
+        }
+
+        match player_state.table_configuration.fascist_board_configuration[prev_fas_policies] {
+            NoAction => NoAction,
+            Kill(_) => retrieve_player_opt_first().map(Kill)?,
+            Investigation(_, _) => {
+                Investigation(retrieve_player_opt_first()?, retrieve_policy_opt_second()?)
+            },
+            RevealParty(_, _) => {
+                RevealParty(retrieve_player_opt_first()?, retrieve_policy_opt_second()?)
+            },
+            TopDeckPeek(_) => TopDeckPeek(retrieve_policy_opt_first(3)?.try_into().unwrap()),
+            SpecialElection(_) => retrieve_player_opt_first().map(SpecialElection)?,
+            PeekAndBurn(_, _, _) => PeekAndBurn(
+                *retrieve_policy_opt_first(1)?.first().unwrap(),
+                retrieve_boolean_opt_second()?,
+                deck_context.atomic_draw(3, 2)
+            )
+        }
     }
     else {
-        "".to_string()
+        NoAction
     };
 
+    let government = ElectedGovernment {
+        president,
+        chancellor,
+        president_claimed_blues,
+        chancellor_claimed_blues,
+        conflict : immediate_conflict,
+        policy_passed,
+        presidential_action,
+        deck_context,
+        chancellor_confirmed_not_hitler : prev_fas_policies
+            >= player_state
+                .table_configuration
+                .hitler_zone_passed_fascist_policies
+    };
+    let government_text = government.format(&player_state.player_info);
+
+    player_state
+        .governments
+        .push(ElectionResult::Election(government))(player_state, true)?;
+
     Ok(Some(format!(
-        "Successfully added a government with president {} (claimed {president_claimed_blues} \
-         blues) and chancellor {} (claimed {chancellor_claimed_blues} blues).{kill}",
-        format_name(president, &player_state.player_info),
-        format_name(chancellor, &player_state.player_info),
+        "Successfully added a government with the following events: {government_text}"
     )))
 }
 
@@ -952,21 +1440,25 @@ pub(crate) fn add_government(
 pub(crate) fn pop_government(
     _args : HashMap<String, Value>,
     context : &mut Context
-) -> Result<Option<String>, Error> {
-    let last = context.player_state.governments.last().cloned();
+) -> Result<Option<String>> {
+    let govs = &mut context.player_state.governments;
+    let last = govs.last().cloned();
 
-    let callback = context.player_state.governments.pop();
+    let callback = govs.remove(govs.len() - 1);
 
     if let Some(removed) = last {
         if let Some(callback) = callback {
             callback(&context.player_state, true)?;
-            Ok(Some(format!(
-                "Successfully removed the last government with president {} and chancellor \
-                 {}.\nRemember to also remove automatically derived facts like conflicts and \
-                 non-hitler confirmations for dead people.",
-                format_name(removed.president, &context.player_state.player_info),
-                format_name(removed.chancellor, &context.player_state.player_info)
-            )))
+            match removed {
+                TopDeck(p, _) => Ok(Some(format!(
+                    "Successfully removed the topdeck failed election which resulted in a {p} \
+                     draw."
+                ))),
+                Election(gov) => Ok(Some(format!(
+                    "Successfully removed the last government with the following events: {}",
+                    gov.format(&context.player_state.player_info)
+                )))
+            }
         }
         else {
             unreachable!()
@@ -977,4 +1469,476 @@ pub(crate) fn pop_government(
             "Successfully removed no government because none existed.".to_string()
         ))
     }
+}
+
+#[debug_invariant(context.invariant())]
+pub(crate) fn topdeck(
+    args : HashMap<String, Value>,
+    context : &mut Context
+) -> Result<Option<String>> {
+    let drawn_policy : String = args["drawn_policy"].convert()?;
+    let drawn_policy : Policy = drawn_policy.parse()?;
+
+    context.player_state.governments.push(TopDeck(
+        drawn_policy,
+        context.player_state.build_next_card_context()
+    ))(&context.player_state, true)?;
+
+    Ok(Some(format!(
+        "Successfully added a top-deck that resulted in a {drawn_policy} policy enactment."
+    )))
+}
+
+#[debug_invariant(context.invariant())]
+pub(crate) fn total_draw_probability(
+    _args : HashMap<String, Value>,
+    context : &mut Context
+) -> Result<Option<String>> {
+    Ok(Some(
+        context
+            .player_state
+            .shuffle_election_results()
+            .iter()
+            .map(|sa| {
+                let analysis = next_blues_count(
+                    sa.initial_deck_liberal,
+                    sa.initial_deck_fascist,
+                    sa.total_leftover,
+                    sa.initial_deck_liberal
+                        .saturating_sub(sa.total_seen_blues()),
+                    0,
+                    0
+                );
+
+                format!(
+                    "Assuming nobody lied, the shuffle #{} has a {analysis} chance of occuring.",
+                    sa.shuffle_index + 1
+                )
+            })
+            .join("\n")
+    ))
+}
+
+// Notes:
+// For everything:
+// - on the paths, the "claims" are the truth, exclude impossible paths
+// - edges leading up to a node contain the relative probability assuming all
+//   previous claims are true
+// - the nodes themselves contain the president, the chancellor, their claims
+//   and the total accumulated probability
+// - if a conflict arises from a peek, add the claimed peek as a possible option
+// - find and purge paths that later turned out to be impossible, e.g., RBB,
+//   RBB, RBB, RRB (7 blues seen, means somebody among the first three must have
+//   gotten RRB if all passed blue)
+// - Limit paths to two "assumed fascists"
+// - put all the connected graphs (1/shuffle) into the same picture
+// - figure out a way to have multiple images in the clipboard
+// For non-conflicted govs:
+// - branch on the third presidential policy
+// - tag the claimed version with a blue circle and the other with a red one
+// For conflicted govs:
+// - If the president claimed RRB, assume that to be true, no further branches
+// - If the president claimed RBB, branch into RRB and RBB
+// - no color tagging
+
+#[derive(Clone)]
+struct TreeNode {
+    relative_probability : DeckAnalysis,
+    absolute_probability : f64,
+    original_claimed_blues : usize,
+    relevant_election_result : ElectionResult,
+    children : Vec<TreeNode>
+}
+
+impl TreeNode {
+    fn invariant(&self) -> bool {
+        self.children
+            .iter()
+            .map(|n| n.relative_probability.num_decks_matching)
+            .sum::<usize>()
+            == self
+                .children
+                .iter()
+                .map(|n| n.relative_probability.num_decks_checked)
+                .max()
+                .unwrap_or(0)
+    }
+}
+
+fn generate_probability_forest(player_state : &PlayerState) -> String {
+    let mut trees = vec![];
+
+    for shuffle in player_state.shuffle_election_results().iter() {
+        let tree = generate_tree(shuffle);
+        let post_processed_tree = filter_paths(tree, |nodes| {
+            main_path_filter_pred(nodes, shuffle, &player_state)
+        });
+        trees.push(draw_tree(
+            post_processed_tree,
+            shuffle,
+            &player_state.player_info
+        ));
+    }
+
+    format!("digraph{{{}}}", trees.into_iter().join(" ; "))
+}
+
+fn main_path_filter_pred(
+    nodes : &[TreeNode],
+    _shuffle_data : &ShuffleAnalysis,
+    _game_state : &PlayerState
+) -> bool {
+    nodes.iter().all(|n| {
+        // n.relative_probability.num_decks_checked > 0 &&
+        n.relative_probability.num_decks_matching > 0
+    })
+}
+
+//#[debug_requires(tree.iter().all(TreeNode::invariant))]
+//#[debug_ensures(ret.iter().all(TreeNode::invariant))]
+fn filter_paths(
+    tree : Vec<TreeNode>,
+    filter_predicate : impl Fn(&[TreeNode]) -> bool
+) -> Vec<TreeNode> {
+    tree.into_iter()
+        .filter_map(|t| {
+            let mut parents = vec![];
+            filter_paths_recursive(&mut parents, t, &filter_predicate)
+        })
+        .collect()
+}
+
+fn filter_paths_recursive(
+    parents : &mut Vec<TreeNode>,
+    mut node : TreeNode,
+    filter_predicate : &impl Fn(&[TreeNode]) -> bool
+) -> Option<TreeNode> {
+    // leaf
+    if node.children.is_empty() {
+        parents.push(node.clone());
+        let keep = filter_predicate(parents);
+        parents.pop();
+        keep.then_some(node)
+    }
+    else {
+        let children = std::mem::take(&mut node.children);
+        parents.push(node.clone());
+        node.children = children
+            .into_iter()
+            .filter_map(|c| filter_paths_recursive(parents, c, filter_predicate))
+            .collect();
+        parents.pop();
+        (!node.children.is_empty()).then_some(node)
+    }
+}
+
+fn draw_tree(
+    tree : Vec<TreeNode>,
+    election_results : &ShuffleAnalysis<'_>,
+    player_info : &PlayerInfos
+) -> String {
+    let root_name = format!("{}", election_results.shuffle_index);
+
+    tree.iter()
+        .enumerate()
+        .map(|(cid, tn)| {
+            draw_tree_recursive(&root_name, &format!("{root_name}{cid}"), tn, player_info)
+        })
+        .flatten()
+        .chain(std::iter::once(format!(
+            "{root_name} [label=\"Shuffle #{}\"]",
+            election_results.shuffle_index + 1
+        )))
+        .join(";")
+}
+
+fn draw_tree_recursive(
+    parent_name : &str,
+    my_name : &str,
+    node : &TreeNode,
+    player_info : &PlayerInfos
+) -> Vec<String> {
+    let node_name = match &node.relevant_election_result {
+        TopDeck(p, _) => format!("Top-Deck: {p}"),
+        Election(eg) => format!(
+            "Assumed Draw: {}\\nPresident {}: {}\\nChancellor {}: {}",
+            generate_claim_pattern_from_blues(eg.president_claimed_blues, 3),
+            player_info.format_name(eg.president),
+            generate_claim_pattern_from_blues(node.original_claimed_blues, 3),
+            player_info.format_name(eg.chancellor),
+            generate_claim_pattern_from_blues(eg.chancellor_claimed_blues, 2)
+        )
+    };
+
+    let mut out_vec = vec![];
+
+    out_vec.push(format!(
+        "{parent_name} -> {my_name} [label=\"{:.1}%\"]",
+        node.relative_probability.probability() * 100.0
+    ));
+    out_vec.push(format!(
+        "{my_name} [label=\"{node_name}\\n{:.1}%\",color={},fontcolor={}]",
+        node.absolute_probability * 100.0,
+        if matches!(&node.relevant_election_result, Election(eg) if eg.president_claimed_blues == node.original_claimed_blues) || matches!(&node.relevant_election_result, TopDeck(_,_)) {
+            "blue"
+        }
+        else {
+            "red"
+        },
+        if matches!(&node.relevant_election_result, Election(eg) if !eg.conflict && eg.president_claimed_blues > eg.chancellor_claimed_blues+1) {
+        "red"
+        }
+        else {"black"}
+    ));
+
+    let mut processed_children = node
+        .children
+        .iter()
+        .enumerate()
+        .map(|(cid, tn)| draw_tree_recursive(my_name, &format!("{my_name}{cid}"), tn, player_info))
+        .flatten()
+        .collect();
+
+    out_vec.append(&mut processed_children);
+
+    out_vec
+}
+
+fn generate_tree(election_results : &ShuffleAnalysis<'_>) -> Vec<TreeNode> {
+    recursively_generate_tree(
+        &election_results,
+        1.0,
+        vec![],
+        election_results.election_results.iter()
+    )
+}
+
+// TODO: generate all in a simple way
+// then iterate over all paths to filter them
+// and remove the last node for each filtered-out one
+// and then clean-up by removing all nodes without children at a depth that
+// doesn't match the max depth
+
+// BBB (3) / BB (2) -> RBB (2)
+// RBB (2) / BB (2) -> BBB (3)
+// RBB (2) / RB (1) -> RRB (1)
+// RRB (1) / RB (1) -> RBB (2)
+// RRR (0) / RR (0) -> RRB (1)
+/*
+let mut copy = eg.clone();
+if copy.president_claimed_blues == copy.chancellor_claimed_blues {
+    copy.president_claimed_blues += 1;
+}
+else {
+    copy.president_claimed_blues = copy.chancellor_claimed_blues;
+};
+copy */
+
+// TODO handle peeks
+// TODO handle early path cancellation / dropping options based on impossibility
+fn recursively_generate_tree<'a>(
+    shuffle_analysis : &ShuffleAnalysis<'a>,
+    parent_absolute_probability : f64,
+    mut parent_ers : Vec<ElectionResult>,
+    mut er_iter : impl Iterator<Item = &'a &'a ElectionResult> + Clone
+) -> Vec<TreeNode> {
+    if let Some(er) = er_iter.next() {
+        let passed_blues = er.passed_blues();
+
+        match er {
+            TopDeck(_, _) => {
+                vec![TreeNode {
+                    relative_probability : complex_card_counter(
+                        shuffle_analysis.initial_deck_liberal,
+                        shuffle_analysis.initial_deck_fascist,
+                        &shuffle_analysis.election_results,
+                        &parent_ers,
+                        er
+                    ),
+                    absolute_probability : parent_absolute_probability,
+                    original_claimed_blues : passed_blues,
+                    relevant_election_result : (*er).clone(),
+                    children : recursively_generate_tree(
+                        shuffle_analysis,
+                        parent_absolute_probability,
+                        {
+                            parent_ers.push((*er).clone());
+                            parent_ers
+                        },
+                        er_iter
+                    )
+                }]
+            },
+            Election(eg) => (0..3)
+                .into_iter()
+                .map(|x| x + passed_blues)
+                .map(|nbc| {
+                    let mut copy = eg.clone();
+                    copy.president_claimed_blues = nbc;
+                    copy
+                })
+                .map(|neg| {
+                    let neg = Election(neg);
+                    let relative_probability = complex_card_counter(
+                        shuffle_analysis.initial_deck_liberal,
+                        shuffle_analysis.initial_deck_fascist,
+                        &shuffle_analysis.election_results,
+                        &parent_ers,
+                        &neg
+                    );
+                    let absolute_probability =
+                        parent_absolute_probability * relative_probability.probability();
+                    TreeNode {
+                        relative_probability,
+                        absolute_probability,
+                        original_claimed_blues : eg.president_claimed_blues,
+                        children : recursively_generate_tree(
+                            shuffle_analysis,
+                            absolute_probability,
+                            {
+                                let mut new_ers = parent_ers.clone();
+                                new_ers.push(neg.clone());
+                                new_ers
+                            },
+                            er_iter.clone()
+                        ),
+                        relevant_election_result : neg
+                    }
+                })
+                .collect()
+        }
+    }
+    else {
+        vec![]
+    }
+}
+
+// Can we use this probability information (perhaps reduced down for each
+// layer?) to enrich the main government graph?
+
+// TODO: can we / do we want to turn this into a DAG?
+#[debug_invariant(context.invariant())]
+pub(crate) fn probability_tree(
+    args : HashMap<String, Value>,
+    context : &mut Context
+) -> Result<Option<String>> {
+    let filename : String = args["filename"].convert()?;
+    let resp_filename = filename.clone();
+    let auto_update : bool = args["auto"].convert()?;
+    let executable : String = args["dot-invocation"].convert()?;
+
+    let dotfile = format!("{filename}.dot");
+    let imagefile = format!("{filename}.png");
+
+    let options = vec![
+        "-Tpng".to_string(),
+        "-o".to_string(),
+        imagefile.clone(),
+        dotfile.clone(),
+    ];
+
+    let (baseline_command, strategy) = executable_parser(executable)?;
+
+    let closure : Callback = Rc::new(move |ps, auto| {
+        if !auto || auto_update {
+            let file_content = generate_probability_forest(&ps);
+
+            fs::write(&dotfile, file_content)?;
+
+            let mut command = Command::new(&baseline_command);
+
+            match strategy {
+                InvocationStrategy::None => return Ok(()),
+                InvocationStrategy::Bash => command
+                    .arg("-c")
+                    .arg(format! {"\"dot\" {}", options.iter().join(" ")}),
+                InvocationStrategy::Directly => command.args(&options)
+            };
+
+            let dot_process = command
+                .stdin(Stdio::null())
+                .stderr(Stdio::piped())
+                .stdout(Stdio::piped())
+                .output()?;
+
+            if !dot_process.stdout.is_empty() {
+                return Err(Error::UnexpectedStdout(dot_process.stdout));
+            }
+            if !dot_process.stderr.is_empty() {
+                return Err(Error::UnexpectedStderr(dot_process.stderr));
+            }
+
+            fs::remove_file(&dotfile)?;
+        }
+
+        Ok(())
+    });
+
+    context
+        .player_state
+        .available_information
+        .register_callback(CallbackKind::ProbabilityTree, Rc::clone(&closure));
+    context
+        .player_state
+        .governments
+        .register_callback(CallbackKind::ProbabilityTree, Rc::clone(&closure));
+    context.player_state.governments.callback()(&context.player_state, false)?;
+
+    Ok(Some(format!(
+        "Run \"dot -Tpng -o {resp_filename}.png {resp_filename}.dot\" in a separate shell (e.g. \
+         bash, cmd, powershell, ...) in the current working directory to generate the graph."
+    )))
+}
+
+fn executable_parser(executable : String) -> Result<(String, InvocationStrategy)> {
+    let executable_l = executable.to_lowercase();
+    let strategy = match executable_l.as_str() {
+        "bash" => InvocationStrategy::Bash,
+        "dot" => InvocationStrategy::Directly,
+        "" => InvocationStrategy::None,
+        _ => return Err(Error::BadExecutable(executable))
+    };
+    Ok((executable_l, strategy))
+}
+
+#[debug_invariant(context.invariant())]
+pub(crate) fn create_game_config(
+    args : HashMap<String, Value>,
+    context : &mut Context
+) -> Result<Option<String>> {
+    let filename : String = args["filename"].convert()?;
+
+    let config = GameConfiguration::interactively_ask_for_configuration();
+
+    fs::write(
+        format!("{filename}.json"),
+        serde_json::to_string_pretty(&config)?
+    )?;
+
+    context.player_state = PlayerState::new(config);
+
+    Ok(Some(format!(
+        "Successfully saved the configuration to {filename}.json. Also initialized the game with \
+         {} possible role assignments.",
+        context.player_state.current_roles().len()
+    )))
+}
+
+#[debug_invariant(context.invariant())]
+pub(crate) fn load_game_config(
+    args : HashMap<String, Value>,
+    context : &mut Context
+) -> Result<Option<String>> {
+    let mut player_state = &mut context.player_state;
+    let filename : String = args["filename"].convert()?;
+
+    *player_state = PlayerState::new(serde_json::from_slice(&fs::read(&filename)?)?);
+
+    Ok(Some(format!(
+        "Successfully loaded the {filename} configuration file. This resulted in a game with the \
+         following characteristics: {}. {} possible role assignments for this table have been \
+         loaded.",
+        player_state.table_configuration,
+        player_state.current_roles().len()
+    )))
 }

@@ -1,8 +1,12 @@
-use std::fmt;
+use itertools::Itertools;
 
-use crate::{PlayerID, secret_role::SecretRole};
+use crate::{
+    players::{PlayerFormatable, PlayerInfos},
+    secret_role::SecretRole,
+    PlayerID, PlayerManager
+};
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum Information {
     ConfirmedNotHitler(PlayerID),
     PolicyConflict(PlayerID, PlayerID),
@@ -14,38 +18,53 @@ pub(crate) enum Information {
         investigator : PlayerID,
         investigatee : PlayerID
     },
-    HardFact(PlayerID, SecretRole)
+    HardFact(PlayerID, SecretRole),
+    AtLeastOneFascist(Vec<PlayerID>)
 }
 
-impl fmt::Display for Information {
-    fn fmt(&self, f : &mut fmt::Formatter<'_>) -> fmt::Result {
+impl PlayerFormatable for Information {
+    fn format(&self, player_info : &PlayerInfos) -> String {
         match self {
             Information::ConfirmedNotHitler(pid) => {
-                write!(f, "Player {pid} is confirmed to not be Hitler.")
+                format!(
+                    "Player {} is confirmed to not be Hitler.",
+                    player_info.format_name(*pid)
+                )
             },
             Information::PolicyConflict(left, right) => {
-                write!(
-                    f,
-                    "Player {left} is in a policy-based conflict with player {right}."
+                format!(
+                    "Player {} is in a policy-based conflict with player {}.",
+                    player_info.format_name(*left),
+                    player_info.format_name(*right)
                 )
             },
             Information::LiberalInvestigation {
                 investigator,
                 investigatee
-            } => write!(
-                f,
-                "Player {investigator} investigated player {investigatee} and claimed to have \
-                 found a liberal."
+            } => format!(
+                "Player {} investigated player {} and claimed to have found a liberal.",
+                player_info.format_name(*investigator),
+                player_info.format_name(*investigatee)
             ),
             Information::FascistInvestigation {
                 investigator,
                 investigatee
-            } => write!(
-                f,
-                "Player {investigator} investigated player {investigatee} and claimed to have \
-                 found a fascist."
+            } => format!(
+                "Player {} investigated player {} and claimed to have found a fascist.",
+                player_info.format_name(*investigator),
+                player_info.format_name(*investigatee)
             ),
-            Information::HardFact(pid, role) => write!(f, "Player {pid} is known to be {role}.")
+            Information::HardFact(pid, role) => format!(
+                "Player {} is known to be {role}.",
+                player_info.format_name(*pid)
+            ),
+            Information::AtLeastOneFascist(suspicious_players) => format!(
+                "At least one of {} is a confirmed fascist.",
+                suspicious_players
+                    .iter()
+                    .map(|pid| format!("Player {}", player_info.format_name(*pid)))
+                    .join(", ")
+            )
         }
     }
 }
