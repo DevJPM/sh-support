@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt, str
 };
 
@@ -8,7 +8,11 @@ use contracts::{debug_ensures, debug_invariant};
 use itertools::Itertools;
 use repl_rs::{Convert, Value};
 
-use crate::{players::ElectionResult, policy::Policy, Context, Error};
+use crate::{
+    players::{ElectionResult, ElectionResult::*},
+    policy::Policy,
+    Context, Error, PlayerID
+};
 
 #[derive(Default, Debug, Clone)]
 pub(crate) struct DeckState {
@@ -156,26 +160,31 @@ pub(crate) fn parse_pattern(
     Ok((num_lib_in_pattern, pattern_length, pattern))
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct DeckAnalysis {
-    pub num_decks_matching : usize,
-    pub num_decks_checked : usize
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FilterResult {
+    pub num_matching : usize,
+    pub num_checked : usize
 }
 
-impl DeckAnalysis {
-    pub fn probability(&self) -> f64 {
-        self.num_decks_matching as f64 / self.num_decks_checked as f64
+impl FilterResult {
+    pub fn probability(&self) -> f64 { self.num_matching as f64 / self.num_checked as f64 }
+
+    pub fn none(out_of : usize) -> Self {
+        FilterResult {
+            num_matching : 0,
+            num_checked : out_of
+        }
     }
 }
 
-impl fmt::Display for DeckAnalysis {
+impl fmt::Display for FilterResult {
     fn fmt(&self, f : &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{:.1}% ({}/{})",
             self.probability() * 100.0,
-            self.num_decks_matching,
-            self.num_decks_checked
+            self.num_matching,
+            self.num_checked
         )
     }
 }
@@ -184,7 +193,8 @@ impl fmt::Display for DeckAnalysis {
 fn hard_facted_complex_card_counter(
     num_total_lib : usize,
     num_total_fasc : usize,
-    hard_facts : Vec<ElectionResult>
+    hard_facts : Vec<ElectionResult>,
+    hard_confirmed_libs : BTreeSet<PlayerID>
 ) -> DeckState {
     let decks = generate_internal(num_total_lib, num_total_fasc);
     DeckState {
@@ -197,12 +207,24 @@ fn hard_facted_complex_card_counter(
                     .iter()
                     .scan(0, |offset, er| {
                         let (drawn, _discarded) = er.cards_total_drawn_discarded();
-                        let ret = count_policies(d, *offset, drawn, Policy::Liberal)
-                            >= er.passed_blues()
-                            && count_policies(d, *offset, drawn, Policy::Fascist)
-                                >= 1 - er.passed_blues();
+                        let blue_count = count_policies(d, *offset, drawn, Policy::Liberal);
+                        let red_count = count_policies(d, *offset, drawn, Policy::Fascist);
+                        let drawn_blue = blue_count >= er.passed_blues();
+                        let drawn_red = red_count >= 1 - er.passed_blues();
+                        let good_liberals = match er {
+                            Election(eg) => {
+                                let president = !hard_confirmed_libs.contains(&eg.president)
+                                    || eg.president_claimed_blues == blue_count;
+                                let chancellor_blue = !hard_confirmed_libs.contains(&eg.chancellor)
+                                    || eg.chancellor_claimed_blues <= blue_count;
+                                let chancellor_red = !hard_confirmed_libs.contains(&eg.chancellor)
+                                    || 2 - eg.chancellor_claimed_blues <= red_count;
+                                president && chancellor_blue && chancellor_red
+                            },
+                            TopDeck(_, _) => true
+                        };
                         *offset += drawn;
-                        Some(ret)
+                        Some(drawn_blue && drawn_red && good_liberals)
                     })
                     .all(|x| x)
             })
@@ -215,18 +237,57 @@ pub(crate) fn complex_card_counter(
     num_total_fasc : usize,
     hard_facts : &[&ElectionResult],
     hypotheses : &[ElectionResult],
+    legal_follow_on_sets : &Vec<Option<BTreeSet<usize>>>,
+    hard_confirmed_liberals : &BTreeSet<usize>,
+    path_assumed_liberals : &BTreeSet<usize>,
     new_hypothesis : &ElectionResult
-) -> DeckAnalysis {
+) -> FilterResult {
     let decks = hard_facted_complex_card_counter(
         num_total_lib,
         num_total_fasc,
-        hard_facts.iter().map(|er| (*er).clone()).collect()
+        hard_facts.iter().map(|er| (*er).clone()).collect(),
+        hard_confirmed_liberals.clone()
     );
     let decks = DeckState {
         num_cards : decks.num_cards,
         actual_decks : decks
             .actual_decks
             .into_iter()
+            .filter(|d| {
+                hard_facts
+                    .iter()
+                    .enumerate()
+                    .scan(0, |offset, (idx, er)| {
+                        let (drawn, _discarded) = er.cards_total_drawn_discarded();
+                        let blue_count = count_policies(d, *offset, drawn, Policy::Liberal);
+                        let red_count = count_policies(d, *offset, drawn, Policy::Fascist);
+                        let follow_on = legal_follow_on_sets
+                            .get(idx)
+                            .map(|seto| {
+                                seto.as_ref()
+                                    .map(|set| set.contains(&blue_count))
+                                    .unwrap_or(true)
+                            })
+                            .unwrap_or(true);
+                        let good_liberals = match er {
+                            Election(eg) => {
+                                let president = !path_assumed_liberals.contains(&eg.president)
+                                    || er.seen_blues() == blue_count; // need to use seen_blues() here because of peek-and-burns
+                                let chancellor_blue = !path_assumed_liberals
+                                    .contains(&eg.chancellor)
+                                    || eg.chancellor_claimed_blues <= blue_count;
+                                let chancellor_red = !path_assumed_liberals
+                                    .contains(&eg.chancellor)
+                                    || 2 - eg.chancellor_claimed_blues <= red_count;
+                                president && chancellor_blue && chancellor_red
+                            },
+                            TopDeck(_, _) => true
+                        };
+                        *offset += drawn;
+                        Some(good_liberals && follow_on)
+                    })
+                    .all(|x| x)
+            })
             .filter(|d| {
                 hypotheses
                     .iter()
@@ -247,8 +308,8 @@ pub(crate) fn complex_card_counter(
         .map(|er| er.cards_total_drawn_discarded().0)
         .sum();
 
-    DeckAnalysis {
-        num_decks_matching : decks
+    FilterResult {
+        num_matching : decks
             .actual_decks
             .iter()
             .filter(|d| {
@@ -260,7 +321,7 @@ pub(crate) fn complex_card_counter(
                 ) == new_hypothesis.seen_blues()
             })
             .count(),
-        num_decks_checked : decks.actual_decks.len()
+        num_checked : decks.actual_decks.len()
     }
 }
 
@@ -272,7 +333,7 @@ pub(crate) fn next_blues_count(
     desired_blues_in_window : usize,
     guaranteed_blues_in_window : usize,
     guaranteed_reds_in_window : usize
-) -> DeckAnalysis {
+) -> FilterResult {
     let decks = generate_internal(num_total_lib, num_total_fasc);
     let decks = DeckState {
         num_cards : decks.num_cards,
@@ -287,15 +348,15 @@ pub(crate) fn next_blues_count(
             .collect()
     };
 
-    DeckAnalysis {
-        num_decks_matching : decks
+    FilterResult {
+        num_matching : decks
             .actual_decks
             .iter()
             .filter(|d| {
                 count_policies(d, 0, window_size, Policy::Liberal) == desired_blues_in_window
             })
             .count(),
-        num_decks_checked : decks.actual_decks.len()
+        num_checked : decks.actual_decks.len()
     }
 }
 

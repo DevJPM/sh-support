@@ -4,14 +4,20 @@ use contracts::debug_invariant;
 use itertools::Itertools;
 use repl_rs::{Convert, Value};
 
-use crate::{error::Error, information::Information, secret_role::SecretRole, PlayerID};
+use crate::{
+    deck::FilterResult,
+    error::{Error, Result},
+    information::Information,
+    secret_role::SecretRole,
+    PlayerID
+};
 
 use super::PlayerState;
 
 fn no_aggressive_hitler_filter(
     roles : &BTreeMap<PlayerID, SecretRole>,
     information : &Information
-) -> Result<bool, Error> {
+) -> Result<bool> {
     let lp = |p| roles.get(p).ok_or(Error::BadPlayerID(*p));
 
     match information {
@@ -28,7 +34,7 @@ fn no_aggressive_hitler_filter(
 fn no_fascist_fascist_conflict_filter(
     roles : &BTreeMap<PlayerID, SecretRole>,
     information : &Information
-) -> Result<bool, Error> {
+) -> Result<bool> {
     let lp = |p| roles.get(p).ok_or(Error::BadPlayerID(*p));
 
     match information {
@@ -44,7 +50,7 @@ fn no_fascist_fascist_conflict_filter(
 fn universal_deducable_information(
     roles : &BTreeMap<PlayerID, SecretRole>,
     information : &Information
-) -> Result<bool, Error> {
+) -> Result<bool> {
     let lp = |p| roles.get(p).ok_or(Error::BadPlayerID(*p));
 
     match information {
@@ -63,7 +69,7 @@ fn universal_deducable_information(
         Information::AtLeastOneFascist(vsp) => Ok(vsp
             .iter()
             .map(lp)
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>>>()?
             .iter()
             .any(|role| role.is_fascist()))
     }
@@ -74,7 +80,7 @@ pub(super) fn valid_role_assignments(
     information : &[Information],
     no_aggressive_hitler : bool,
     no_fascist_fascist_conflict : bool
-) -> Result<bool, Error> {
+) -> Result<bool> {
     information
         .iter()
         .map(|i| {
@@ -82,22 +88,27 @@ pub(super) fn valid_role_assignments(
                 && (!no_aggressive_hitler || no_aggressive_hitler_filter(roles, i)?)
                 && (!no_fascist_fascist_conflict || no_fascist_fascist_conflict_filter(roles, i)?))
         })
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<Result<Vec<_>>>()
         .map(|vb| vb.into_iter().all(|x| x))
 }
 
 pub(super) fn filter_assigned_roles_inconvenient(
     player_state : &PlayerState,
     allow_fascist_fascist_conflict : bool,
-    allow_aggressive_hitler : bool
-) -> Result<Vec<BTreeMap<usize, SecretRole>>, Error> {
+    allow_aggressive_hitler : bool,
+    temporary_infomration : &[Information]
+) -> Result<Vec<BTreeMap<usize, SecretRole>>> {
     let filtered_assignments = player_state
         .current_roles()
         .into_iter()
         .filter(|roles| {
             valid_role_assignments(
                 roles,
-                &player_state.collect_information(),
+                &player_state
+                    .collect_information()
+                    .into_iter()
+                    .chain(temporary_infomration.iter().cloned())
+                    .collect_vec(),
                 !allow_aggressive_hitler,
                 !allow_fascist_fascist_conflict
             )
@@ -112,26 +123,37 @@ pub(super) fn filter_assigned_roles_inconvenient(
     }
 }
 
-pub(super) fn filter_assigned_roles(
-    args : HashMap<String, Value>,
-    player_state : &PlayerState
-) -> Result<Vec<BTreeMap<usize, SecretRole>>, Error> {
+pub(super) fn parse_filter_args(args : HashMap<String, Value>) -> Result<(bool, bool)> {
     let allow_fascist_fascist_conflict : bool = args["allow_fascist_fascist_conflict"].convert()?;
     let allow_aggressive_hitler : bool = args["allow_aggressive_hitler"].convert()?;
 
+    Ok((allow_fascist_fascist_conflict, allow_aggressive_hitler))
+}
+
+pub(super) fn filter_assigned_roles(
+    (allow_fascist_fascist_conflict, allow_aggressive_hitler) : (bool, bool),
+    player_state : &PlayerState,
+    temporary_infomration : &[Information]
+) -> Result<Vec<BTreeMap<usize, SecretRole>>> {
     filter_assigned_roles_inconvenient(
         player_state,
         allow_fascist_fascist_conflict,
-        allow_aggressive_hitler
+        allow_aggressive_hitler,
+        temporary_infomration
     )
 }
 
-#[debug_invariant(context.invariant())]
+#[debug_invariant(player_state.invariant())]
 pub(super) fn filtered_histogramm(
-    args : HashMap<String, Value>,
-    context : &PlayerState
-) -> Result<BTreeMap<PlayerID, HashMap<SecretRole, usize>>, Error> {
-    let filtered_assignments = filter_assigned_roles(args, context)?;
+    (allow_fascist_fascist_conflict, allow_aggressive_hitler) : (bool, bool),
+    player_state : &PlayerState,
+    temporary_infomration : &[Information]
+) -> Result<BTreeMap<PlayerID, (HashMap<SecretRole, FilterResult>, usize)>> {
+    let filtered_assignments = filter_assigned_roles(
+        (allow_fascist_fascist_conflict, allow_aggressive_hitler),
+        player_state,
+        temporary_infomration
+    )?;
 
     Ok(filtered_assignments
         .into_iter()
@@ -140,16 +162,40 @@ pub(super) fn filtered_histogramm(
         .group_by(|(pid, _role)| *pid)
         .into_iter()
         .map(|(pid, group)| {
+            let counted = group
+                .into_iter()
+                .map(|(_pid, role)| role)
+                .sorted()
+                .group_by(|r| *r)
+                .into_iter()
+                .map(|(role, group)| {
+                    (
+                        role,
+                        FilterResult {
+                            num_matching : group.count(),
+                            num_checked : 0
+                        }
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let total = counted.iter().map(|(_pid, count)| count.num_matching).sum();
             (
                 pid,
-                group
-                    .into_iter()
-                    .map(|(_pid, role)| role)
-                    .sorted()
-                    .group_by(|r| *r)
-                    .into_iter()
-                    .map(|(role, group)| (role, group.count()))
-                    .collect()
+                (
+                    counted
+                        .into_iter()
+                        .map(|(pid, count)| {
+                            (
+                                pid,
+                                FilterResult {
+                                    num_matching : count.num_matching,
+                                    num_checked : total
+                                }
+                            )
+                        })
+                        .collect(),
+                    total
+                )
             )
         })
         .collect())

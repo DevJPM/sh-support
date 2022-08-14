@@ -15,7 +15,7 @@ use repl_rs::{Convert, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    deck::{complex_card_counter, next_blues_count, parse_pattern, DeckAnalysis},
+    deck::{next_blues_count, parse_pattern, FilterResult},
     error::{Error, Result},
     information::Information,
     policy::Policy,
@@ -29,6 +29,8 @@ mod callback_vector;
 use callback_vector::*;
 pub mod game_configuration;
 use game_configuration::*;
+mod tree;
+use tree::*;
 
 /// CardContext always describes the situation before
 /// the associated (set of) card(s) was drawn
@@ -390,6 +392,7 @@ struct ShuffleAnalysis<'a> {
     election_results : Vec<&'a ElectionResult>,
     initial_deck_fascist : usize,
     initial_deck_liberal : usize,
+    #[allow(dead_code)]
     total_discarded : usize,
     total_leftover : usize
 }
@@ -556,6 +559,8 @@ impl ElectionResult {
             0
         }
     }
+
+    //pub(crate) fn double
 }
 
 pub(crate) trait PlayerFormatable {
@@ -577,11 +582,11 @@ use ElectionResult::*;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct ElectedGovernment {
-    president : PlayerID,
-    chancellor : PlayerID,
+    pub president : PlayerID,
+    pub chancellor : PlayerID,
     pub president_claimed_blues : usize,
-    chancellor_claimed_blues : usize,
-    conflict : bool,
+    pub chancellor_claimed_blues : usize,
+    pub conflict : bool,
     policy_passed : Policy,
     presidential_action : PresidentialAction,
     deck_context : CardContext,
@@ -934,7 +939,7 @@ pub(crate) fn debug_filtered_roles(
     context : &mut Context
 ) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
-    let filtered_assignments = filter_assigned_roles(args, player_state)?;
+    let filtered_assignments = filter_assigned_roles(parse_filter_args(args)?, player_state, &[])?;
 
     Ok(Some(
         filtered_assignments
@@ -958,7 +963,7 @@ pub(crate) fn impossible_teams(
     let player_state = &mut context.player_state;
     let num_fascists = player_state.table_configuration.num_regular_fascists + 1;
 
-    let filtered_assignments = filter_assigned_roles(args, player_state)?;
+    let filtered_assignments = filter_assigned_roles(parse_filter_args(args)?, player_state, &[])?;
 
     let legal_fascist_positions = filtered_assignments
         .into_iter()
@@ -1019,28 +1024,27 @@ pub(crate) fn hitler_snipe(
     context : &mut Context
 ) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
-    let histogram = filtered_histogramm(args, player_state)?;
+    let histogram = filtered_histogramm(parse_filter_args(args)?, player_state, &[])?;
 
     Ok(Some(
         histogram
             .iter()
-            .map(|(pid, roles)| {
+            .map(|(pid, (roles, total))| {
                 (
                     pid,
-                    (
-                        *roles.get(&SecretRole::Hitler).unwrap_or(&0),
-                        roles.iter().map(|(_role, count)| count).sum::<usize>()
-                    )
+                    roles
+                        .get(&SecretRole::Hitler)
+                        .copied()
+                        .unwrap_or(FilterResult::none(*total))
                 )
             })
-            .sorted_by_key(|(_pid, (hitler_count, _total_count))| -(*hitler_count as isize))
+            .sorted_by_key(|(_pid, fr)| -(fr.num_matching as isize))
             .enumerate()
-            .map(|(index, (pid, (hitler_count, total_count)))| {
+            .map(|(index, (pid, fr))| {
                 format!(
-                    "{}. Player {}: {:.1}% ({hitler_count}/{total_count}) chance of being Hitler.",
+                    "{}. Player {}: {fr} chance of being Hitler.",
                     index + 1,
                     player_state.player_info.format_name(*pid),
-                    (hitler_count as f64 / total_count as f64) * 100.0
                 )
             })
             .join("\n")
@@ -1053,26 +1057,24 @@ pub(crate) fn liberal_percent(
     context : &mut Context
 ) -> Result<Option<String>> {
     let mut player_state = &mut context.player_state;
-    let histogram = filtered_histogramm(args, player_state)?;
+    let histogram = filtered_histogramm(parse_filter_args(args)?, player_state, &[])?;
 
     Ok(Some(
         histogram
             .iter()
-            .map(|(pid, roles)| {
+            .map(|(pid, (roles, total))| {
                 (
                     pid,
-                    (
-                        *roles.get(&SecretRole::Liberal).unwrap_or(&0),
-                        roles.iter().map(|(_role, count)| count).sum::<usize>()
-                    )
+                    roles
+                        .get(&SecretRole::Liberal)
+                        .copied()
+                        .unwrap_or(FilterResult::none(*total))
                 )
             })
-            .sorted_by_key(|(pid, (_lib_count, _total_count))| *pid)
-            .map(|(pid, (lib_count, total_count))| {
+            .map(|(pid, lib_count)| {
                 format!(
-                    "Player {}: {:.1}% ({lib_count}/{total_count}) chance of being a liberal.",
-                    player_state.player_info.format_name(*pid),
-                    (lib_count as f64 / total_count as f64) * 100.0
+                    "Player {}: {lib_count} chance of being a liberal.",
+                    player_state.player_info.format_name(*pid)
                 )
             })
             .join("\n")
@@ -1105,9 +1107,6 @@ fn generate_dot_report(
     for (index, gov) in governments.iter().enumerate() {
         match gov {
             Election(gov) => {
-                let mut chancellor_claim =
-                    generate_claim_pattern_from_blues(gov.chancellor_claimed_blues, 2);
-                chancellor_claim.remove(0);
                 statements.push(format!(
                     "{}->{} [label={},color={},dir={},taillabel={},headlabel={}]",
                     gov.president,
@@ -1132,7 +1131,7 @@ fn generate_dot_report(
                         "none"
                     },
                     generate_claim_pattern_from_blues(gov.president_claimed_blues,3),
-                    chancellor_claim
+                    generate_claim_pattern_from_blues(gov.chancellor_claimed_blues, 2)
                 ));
                 if let Kill(killed_player) = gov.presidential_action {
                     statements.push(format!(
@@ -1325,9 +1324,6 @@ pub(crate) fn add_government(
     let presidential_pattern : String = args["presidential_blues"].convert()?;
     let chancellor_pattern : String = args["chancellor_blues"].convert()?;
 
-    // TODO: validate that you can actually choose the given government based on
-    // exclusion rules (previous elected people and max allowed number of skips)
-    // also remember to include special elections and kills
     player_state.player_interactable(president, &player_state.player_info)?;
     player_state.player_interactable(chancellor, &player_state.player_info)?;
 
@@ -1517,300 +1513,6 @@ pub(crate) fn total_draw_probability(
             })
             .join("\n")
     ))
-}
-
-// Notes:
-// For everything:
-// - on the paths, the "claims" are the truth, exclude impossible paths
-// - edges leading up to a node contain the relative probability assuming all
-//   previous claims are true
-// - the nodes themselves contain the president, the chancellor, their claims
-//   and the total accumulated probability
-// - if a conflict arises from a peek, add the claimed peek as a possible option
-// - find and purge paths that later turned out to be impossible, e.g., RBB,
-//   RBB, RBB, RRB (7 blues seen, means somebody among the first three must have
-//   gotten RRB if all passed blue)
-// - Limit paths to two "assumed fascists"
-// - put all the connected graphs (1/shuffle) into the same picture
-// - figure out a way to have multiple images in the clipboard
-// For non-conflicted govs:
-// - branch on the third presidential policy
-// - tag the claimed version with a blue circle and the other with a red one
-// For conflicted govs:
-// - If the president claimed RRB, assume that to be true, no further branches
-// - If the president claimed RBB, branch into RRB and RBB
-// - no color tagging
-
-#[derive(Clone)]
-struct TreeNode {
-    relative_probability : DeckAnalysis,
-    absolute_probability : f64,
-    original_claimed_blues : usize,
-    relevant_election_result : ElectionResult,
-    children : Vec<TreeNode>
-}
-
-impl TreeNode {
-    fn invariant(&self) -> bool {
-        self.children
-            .iter()
-            .map(|n| n.relative_probability.num_decks_matching)
-            .sum::<usize>()
-            == self
-                .children
-                .iter()
-                .map(|n| n.relative_probability.num_decks_checked)
-                .max()
-                .unwrap_or(0)
-    }
-}
-
-fn generate_probability_forest(player_state : &PlayerState) -> String {
-    let mut trees = vec![];
-
-    for shuffle in player_state.shuffle_election_results().iter() {
-        let tree = generate_tree(shuffle);
-        let post_processed_tree = filter_paths(tree, |nodes| {
-            main_path_filter_pred(nodes, shuffle, &player_state)
-        });
-        trees.push(draw_tree(
-            post_processed_tree,
-            shuffle,
-            &player_state.player_info
-        ));
-    }
-
-    format!("digraph{{{}}}", trees.into_iter().join(" ; "))
-}
-
-fn main_path_filter_pred(
-    nodes : &[TreeNode],
-    _shuffle_data : &ShuffleAnalysis,
-    _game_state : &PlayerState
-) -> bool {
-    nodes.iter().all(|n| {
-        // n.relative_probability.num_decks_checked > 0 &&
-        n.relative_probability.num_decks_matching > 0
-    })
-}
-
-//#[debug_requires(tree.iter().all(TreeNode::invariant))]
-//#[debug_ensures(ret.iter().all(TreeNode::invariant))]
-fn filter_paths(
-    tree : Vec<TreeNode>,
-    filter_predicate : impl Fn(&[TreeNode]) -> bool
-) -> Vec<TreeNode> {
-    tree.into_iter()
-        .filter_map(|t| {
-            let mut parents = vec![];
-            filter_paths_recursive(&mut parents, t, &filter_predicate)
-        })
-        .collect()
-}
-
-fn filter_paths_recursive(
-    parents : &mut Vec<TreeNode>,
-    mut node : TreeNode,
-    filter_predicate : &impl Fn(&[TreeNode]) -> bool
-) -> Option<TreeNode> {
-    // leaf
-    if node.children.is_empty() {
-        parents.push(node.clone());
-        let keep = filter_predicate(parents);
-        parents.pop();
-        keep.then_some(node)
-    }
-    else {
-        let children = std::mem::take(&mut node.children);
-        parents.push(node.clone());
-        node.children = children
-            .into_iter()
-            .filter_map(|c| filter_paths_recursive(parents, c, filter_predicate))
-            .collect();
-        parents.pop();
-        (!node.children.is_empty()).then_some(node)
-    }
-}
-
-fn draw_tree(
-    tree : Vec<TreeNode>,
-    election_results : &ShuffleAnalysis<'_>,
-    player_info : &PlayerInfos
-) -> String {
-    let root_name = format!("{}", election_results.shuffle_index);
-
-    tree.iter()
-        .enumerate()
-        .map(|(cid, tn)| {
-            draw_tree_recursive(&root_name, &format!("{root_name}{cid}"), tn, player_info)
-        })
-        .flatten()
-        .chain(std::iter::once(format!(
-            "{root_name} [label=\"Shuffle #{}\"]",
-            election_results.shuffle_index + 1
-        )))
-        .join(";")
-}
-
-fn draw_tree_recursive(
-    parent_name : &str,
-    my_name : &str,
-    node : &TreeNode,
-    player_info : &PlayerInfos
-) -> Vec<String> {
-    let node_name = match &node.relevant_election_result {
-        TopDeck(p, _) => format!("Top-Deck: {p}"),
-        Election(eg) => format!(
-            "Assumed Draw: {}\\nPresident {}: {}\\nChancellor {}: {}",
-            generate_claim_pattern_from_blues(eg.president_claimed_blues, 3),
-            player_info.format_name(eg.president),
-            generate_claim_pattern_from_blues(node.original_claimed_blues, 3),
-            player_info.format_name(eg.chancellor),
-            generate_claim_pattern_from_blues(eg.chancellor_claimed_blues, 2)
-        )
-    };
-
-    let mut out_vec = vec![];
-
-    out_vec.push(format!(
-        "{parent_name} -> {my_name} [label=\"{:.1}%\"]",
-        node.relative_probability.probability() * 100.0
-    ));
-    out_vec.push(format!(
-        "{my_name} [label=\"{node_name}\\n{:.1}%\",color={},fontcolor={}]",
-        node.absolute_probability * 100.0,
-        if matches!(&node.relevant_election_result, Election(eg) if eg.president_claimed_blues == node.original_claimed_blues) || matches!(&node.relevant_election_result, TopDeck(_,_)) {
-            "blue"
-        }
-        else {
-            "red"
-        },
-        if matches!(&node.relevant_election_result, Election(eg) if !eg.conflict && eg.president_claimed_blues > eg.chancellor_claimed_blues+1) {
-        "red"
-        }
-        else {"black"}
-    ));
-
-    let mut processed_children = node
-        .children
-        .iter()
-        .enumerate()
-        .map(|(cid, tn)| draw_tree_recursive(my_name, &format!("{my_name}{cid}"), tn, player_info))
-        .flatten()
-        .collect();
-
-    out_vec.append(&mut processed_children);
-
-    out_vec
-}
-
-fn generate_tree(election_results : &ShuffleAnalysis<'_>) -> Vec<TreeNode> {
-    recursively_generate_tree(
-        &election_results,
-        1.0,
-        vec![],
-        election_results.election_results.iter()
-    )
-}
-
-// TODO: generate all in a simple way
-// then iterate over all paths to filter them
-// and remove the last node for each filtered-out one
-// and then clean-up by removing all nodes without children at a depth that
-// doesn't match the max depth
-
-// BBB (3) / BB (2) -> RBB (2)
-// RBB (2) / BB (2) -> BBB (3)
-// RBB (2) / RB (1) -> RRB (1)
-// RRB (1) / RB (1) -> RBB (2)
-// RRR (0) / RR (0) -> RRB (1)
-/*
-let mut copy = eg.clone();
-if copy.president_claimed_blues == copy.chancellor_claimed_blues {
-    copy.president_claimed_blues += 1;
-}
-else {
-    copy.president_claimed_blues = copy.chancellor_claimed_blues;
-};
-copy */
-
-// TODO handle peeks
-// TODO handle early path cancellation / dropping options based on impossibility
-fn recursively_generate_tree<'a>(
-    shuffle_analysis : &ShuffleAnalysis<'a>,
-    parent_absolute_probability : f64,
-    mut parent_ers : Vec<ElectionResult>,
-    mut er_iter : impl Iterator<Item = &'a &'a ElectionResult> + Clone
-) -> Vec<TreeNode> {
-    if let Some(er) = er_iter.next() {
-        let passed_blues = er.passed_blues();
-
-        match er {
-            TopDeck(_, _) => {
-                vec![TreeNode {
-                    relative_probability : complex_card_counter(
-                        shuffle_analysis.initial_deck_liberal,
-                        shuffle_analysis.initial_deck_fascist,
-                        &shuffle_analysis.election_results,
-                        &parent_ers,
-                        er
-                    ),
-                    absolute_probability : parent_absolute_probability,
-                    original_claimed_blues : passed_blues,
-                    relevant_election_result : (*er).clone(),
-                    children : recursively_generate_tree(
-                        shuffle_analysis,
-                        parent_absolute_probability,
-                        {
-                            parent_ers.push((*er).clone());
-                            parent_ers
-                        },
-                        er_iter
-                    )
-                }]
-            },
-            Election(eg) => (0..3)
-                .into_iter()
-                .map(|x| x + passed_blues)
-                .map(|nbc| {
-                    let mut copy = eg.clone();
-                    copy.president_claimed_blues = nbc;
-                    copy
-                })
-                .map(|neg| {
-                    let neg = Election(neg);
-                    let relative_probability = complex_card_counter(
-                        shuffle_analysis.initial_deck_liberal,
-                        shuffle_analysis.initial_deck_fascist,
-                        &shuffle_analysis.election_results,
-                        &parent_ers,
-                        &neg
-                    );
-                    let absolute_probability =
-                        parent_absolute_probability * relative_probability.probability();
-                    TreeNode {
-                        relative_probability,
-                        absolute_probability,
-                        original_claimed_blues : eg.president_claimed_blues,
-                        children : recursively_generate_tree(
-                            shuffle_analysis,
-                            absolute_probability,
-                            {
-                                let mut new_ers = parent_ers.clone();
-                                new_ers.push(neg.clone());
-                                new_ers
-                            },
-                            er_iter.clone()
-                        ),
-                        relevant_election_result : neg
-                    }
-                })
-                .collect()
-        }
-    }
-    else {
-        vec![]
-    }
 }
 
 // Can we use this probability information (perhaps reduced down for each
